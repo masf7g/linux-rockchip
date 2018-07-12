@@ -173,8 +173,12 @@
 		regulator-always-on;
 		regulator-boot-on;
 		regulator-min-microvolt = <800000>;
-		regulator-max-microvolt = <1400000>;
+		regulator-max-microvolt = <1100000>;
 		vin-supply = <&vcc_sys>;
+
+		/* for rockchip boot on */
+		rockchip,pwm_id = <2>;
+		rockchip,pwm_voltage = <1000000>;
 	};
 };
 
@@ -218,7 +222,7 @@
 	snps,reset-active-low;
 	snps,reset-delays-us = <0 10000 50000>;
 	tx_delay = <0x28>;
-	rx_delay = <0x11>;
+	rx_delay = <0x1b>;
 	status = "okay";
 };
 
@@ -430,6 +434,7 @@
 		regulator-boot-on;
 		vin-supply = <&vcc_sys>;
 
+		regulator-initial-state = <3>;
 		regulator-state-mem {
 			regulator-off-in-suspend;
 		};
@@ -447,6 +452,7 @@
 		regulator-boot-on;
 		vin-supply = <&vcc_sys>;
 
+		regulator-initial-state = <3>;
 		regulator-state-mem {
 			regulator-off-in-suspend;
 		};
