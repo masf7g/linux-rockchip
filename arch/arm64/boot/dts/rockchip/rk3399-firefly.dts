@@ -207,8 +207,12 @@
 		regulator-always-on;
 		regulator-boot-on;
 		regulator-min-microvolt = <800000>;
-		regulator-max-microvolt = <1400000>;
+		regulator-max-microvolt = <1100000>;
 		vin-supply = <&vcc_sys>;
+
+		/* for rockchip boot on */
+		rockchip,pwm_id = <2>;
+		rockchip,pwm_voltage = <1000000>;
 	};
 };
 
@@ -252,7 +256,7 @@
 	snps,reset-active-low;
 	snps,reset-delays-us = <0 10000 50000>;
 	tx_delay = <0x28>;
-	rx_delay = <0x11>;
+	rx_delay = <0x1b>;
 	status = "okay";
 };
 
@@ -456,6 +460,8 @@
 		compatible = "silergy,syr827";
 		reg = <0x40>;
 		fcs,suspend-voltage-selector = <1>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cpu_b_sleep_h>;
 		regulator-name = "vdd_cpu_b";
 		regulator-min-microvolt = <712500>;
 		regulator-max-microvolt = <1500000>;
@@ -464,6 +470,7 @@
 		regulator-boot-on;
 		vin-supply = <&vcc_sys>;
 
+		regulator-initial-state = <3>;
 		regulator-state-mem {
 			regulator-off-in-suspend;
 		};
@@ -473,6 +480,8 @@
 		compatible = "silergy,syr828";
 		reg = <0x41>;
 		fcs,suspend-voltage-selector = <1>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&gpu_sleep_h>;
 		regulator-name = "vdd_gpu";
 		regulator-min-microvolt = <712500>;
 		regulator-max-microvolt = <1500000>;
@@ -481,6 +490,7 @@
 		regulator-boot-on;
 		vin-supply = <&vcc_sys>;
 
+		regulator-initial-state = <3>;
 		regulator-state-mem {
 			regulator-off-in-suspend;
 		};
@@ -589,11 +599,11 @@
 	};
 
 	pmic {
-		vsel1_gpio: vsel1-gpio {
+		cpu_b_sleep_h: cpu-b-sleep-h {
 			rockchip,pins = <1 RK_PC2 RK_FUNC_GPIO &pcfg_pull_down>;
 		};
 
-		vsel2_gpio: vsel2-gpio {
+		gpu_sleep_h: gpu-sleep-h {
 			rockchip,pins = <1 RK_PB6 RK_FUNC_GPIO &pcfg_pull_down>;
 		};
 	};
