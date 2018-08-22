@@ -823,6 +823,12 @@ void __init setup_arch(char **cmdline_p)
 	memblock_reserve(__pa_symbol(_text),
 			 (unsigned long)__bss_stop - (unsigned long)_text);
 
+	/*
+	 * Make sure page 0 is always reserved because on systems with
+	 * L1TF its contents can be leaked to user processes.
+	 */
+	memblock_reserve(0, PAGE_SIZE);
+
 	early_reserve_initrd();
 
 	/*
@@ -992,11 +998,6 @@ void __init setup_arch(char **cmdline_p)
 #endif
 		setup_clear_cpu_cap(X86_FEATURE_APIC);
 	}
-
-#ifdef CONFIG_PCI
-	if (pci_early_dump_regs)
-		early_dump_pci_devices();
-#endif
 
 	e820__reserve_setup_data();
 	e820__finish_early_params();
