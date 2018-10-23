@@ -685,6 +685,8 @@
 # define DP_EDP_12			    0x01
 # define DP_EDP_13			    0x02
 # define DP_EDP_14			    0x03
+# define DP_EDP_14a                         0x04    /* eDP 1.4a */
+# define DP_EDP_14b                         0x05    /* eDP 1.4b */
 
 #define DP_EDP_GENERAL_CAP_1		    0x701
 # define DP_EDP_TCON_BACKLIGHT_ADJUSTMENT_CAP		(1 << 0)
@@ -1261,12 +1263,12 @@ int drm_dp_read_desc(struct drm_dp_aux *aux, struct drm_dp_desc *desc,
  */
 enum drm_dp_quirk {
 	/**
-	 * @DP_DPCD_QUIRK_LIMITED_M_N:
+	 * @DP_DPCD_QUIRK_CONSTANT_N:
 	 *
 	 * The device requires main link attributes Mvid and Nvid to be limited
-	 * to 16 bits.
+	 * to 16 bits. So will give a constant value (0x8000) for compatability.
 	 */
-	DP_DPCD_QUIRK_LIMITED_M_N,
+	DP_DPCD_QUIRK_CONSTANT_N,
 };
 
 /**

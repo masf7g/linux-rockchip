@@ -24,6 +24,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/module.h>
 #include <linux/of_graph.h>
+#include <linux/of_platform.h>
 #include <linux/component.h>
 #include <linux/console.h>
 #include <linux/iommu.h>
@@ -267,6 +268,53 @@ static const struct dev_pm_ops rockchip_drm_pm_ops = {
 static struct platform_driver *rockchip_sub_drivers[MAX_ROCKCHIP_SUB_DRIVERS];
 static int num_rockchip_sub_drivers;
 
+/*
+ * Check if a vop endpoint is leading to a rockchip subdriver or bridge.
+ * Should be called from the component bind stage of the drivers
+ * to ensure that all subdrivers are probed.
+ *
+ * @ep: endpoint of a rockchip vop
+ *
+ * returns true if subdriver, false if external bridge and -ENODEV
+ * if remote port does not contain a device.
+ */
+int rockchip_drm_endpoint_is_subdriver(struct device_node *ep)
+{
+	struct device_node *node = of_graph_get_remote_port_parent(ep);
+	struct platform_device *pdev;
+	struct device_driver *drv;
+	int i;
+
+	if (!node)
+		return -ENODEV;
+
+	/* status disabled will prevent creation of platform-devices */
+	pdev = of_find_device_by_node(node);
+	of_node_put(node);
+	if (!pdev)
+		return -ENODEV;
+
+	/*
+	 * All rockchip subdrivers have probed at this point, so
+	 * any device not having a driver now is an external bridge.
+	 */
+	drv = pdev->dev.driver;
+	if (!drv) {
+		platform_device_put(pdev);
+		return false;
+	}
+
+	for (i = 0; i < num_rockchip_sub_drivers; i++) {
+		if (rockchip_sub_drivers[i] == to_platform_driver(drv)) {
+			platform_device_put(pdev);
+			return true;
+		}
+	}
+
+	platform_device_put(pdev);
+	return false;
+}
+
 static int compare_dev(struct device *dev, void *data)
 {
 	return dev == (struct device *)data;
@@ -400,6 +448,11 @@ static int rockchip_drm_platform_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static void rockchip_drm_platform_shutdown(struct platform_device *pdev)
+{
+	rockchip_drm_platform_remove(pdev);
+}
+
 static const struct of_device_id rockchip_drm_dt_ids[] = {
 	{ .compatible = "rockchip,display-subsystem", },
 	{ /* sentinel */ },
@@ -409,6 +462,7 @@ MODULE_DEVICE_TABLE(of, rockchip_drm_dt_ids);
 static struct platform_driver rockchip_drm_platform_driver = {
 	.probe = rockchip_drm_platform_probe,
 	.remove = rockchip_drm_platform_remove,
+	.shutdown = rockchip_drm_platform_shutdown,
 	.driver = {
 		.name = "rockchip-drm",
 		.of_match_table = rockchip_drm_dt_ids,

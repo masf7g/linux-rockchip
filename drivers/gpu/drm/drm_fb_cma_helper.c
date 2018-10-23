@@ -124,10 +124,7 @@ int drm_fb_cma_fbdev_init(struct drm_device *dev, unsigned int preferred_bpp,
 
 	/* dev->fb_helper will indirectly point to fbdev_cma after this call */
 	fbdev_cma = drm_fbdev_cma_init(dev, preferred_bpp, max_conn_count);
-	if (IS_ERR(fbdev_cma))
-		return PTR_ERR(fbdev_cma);
-
-	return 0;
+	return PTR_ERR_OR_ZERO(fbdev_cma);
 }
 EXPORT_SYMBOL_GPL(drm_fb_cma_fbdev_init);
 
@@ -167,7 +164,7 @@ struct drm_fbdev_cma *drm_fbdev_cma_init(struct drm_device *dev,
 
 	fb_helper = &fbdev_cma->fb_helper;
 
-	ret = drm_client_new(dev, &fb_helper->client, "fbdev", NULL);
+	ret = drm_client_init(dev, &fb_helper->client, "fbdev", NULL);
 	if (ret)
 		goto err_free;
 
@@ -175,6 +172,8 @@ struct drm_fbdev_cma *drm_fbdev_cma_init(struct drm_device *dev,
 					preferred_bpp, max_conn_count);
 	if (ret)
 		goto err_client_put;
+
+	drm_client_add(&fb_helper->client);
 
 	return fbdev_cma;
 

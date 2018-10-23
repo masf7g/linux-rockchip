@@ -1541,7 +1541,7 @@ int drm_wait_vblank_ioctl(struct drm_device *dev, void *data,
 	if (vblwait->request.type &
 	    ~(_DRM_VBLANK_TYPES_MASK | _DRM_VBLANK_FLAGS_MASK |
 	      _DRM_VBLANK_HIGH_CRTC_MASK)) {
-		DRM_ERROR("Unsupported type value 0x%x, supported mask 0x%x\n",
+		DRM_DEBUG("Unsupported type value 0x%x, supported mask 0x%x\n",
 			  vblwait->request.type,
 			  (_DRM_VBLANK_TYPES_MASK | _DRM_VBLANK_FLAGS_MASK |
 			   _DRM_VBLANK_HIGH_CRTC_MASK));
@@ -1771,7 +1771,7 @@ int drm_crtc_get_sequence_ioctl(struct drm_device *dev, void *data,
 	int ret;
 
 	if (!drm_core_check_feature(dev, DRIVER_MODESET))
-		return -EINVAL;
+		return -EOPNOTSUPP;
 
 	if (!dev->irq_enabled)
 		return -EINVAL;
@@ -1829,7 +1829,7 @@ int drm_crtc_queue_sequence_ioctl(struct drm_device *dev, void *data,
 	unsigned long spin_flags;
 
 	if (!drm_core_check_feature(dev, DRIVER_MODESET))
-		return -EINVAL;
+		return -EOPNOTSUPP;
 
 	if (!dev->irq_enabled)
 		return -EINVAL;

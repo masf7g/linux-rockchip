@@ -21,6 +21,8 @@
 #include <linux/debugfs.h>
 #include <linux/dma-buf.h>
 
+#include <drm/drm_atomic_uapi.h>
+
 #include "msm_drv.h"
 #include "dpu_kms.h"
 #include "dpu_formats.h"
@@ -1479,8 +1481,6 @@ static void dpu_plane_destroy(struct drm_plane *plane)
 		_dpu_plane_set_qos_ctrl(plane, false, DPU_PLANE_QOS_PANIC_CTRL);
 
 		mutex_destroy(&pdpu->lock);
-
-		drm_plane_helper_disable(plane, NULL);
 
 		/* this will destroy the states as well */
 		drm_plane_cleanup(plane);

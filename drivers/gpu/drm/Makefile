@@ -18,7 +18,8 @@ drm-y       :=	drm_auth.o drm_bufs.o drm_cache.o \
 		drm_encoder.o drm_mode_object.o drm_property.o \
 		drm_plane.o drm_color_mgmt.o drm_print.o \
 		drm_dumb_buffers.o drm_mode_config.o drm_vblank.o \
-		drm_syncobj.o drm_lease.o drm_writeback.o drm_client.o
+		drm_syncobj.o drm_lease.o drm_writeback.o drm_client.o \
+		drm_atomic_uapi.o
 
 drm-$(CONFIG_DRM_LIB_RANDOM) += lib/drm_random.o
 drm-$(CONFIG_DRM_VM) += drm_vm.o
@@ -35,7 +36,8 @@ drm_kms_helper-y := drm_crtc_helper.o drm_dp_helper.o drm_probe_helper.o \
 		drm_plane_helper.o drm_dp_mst_topology.o drm_atomic_helper.o \
 		drm_kms_helper_common.o drm_dp_dual_mode_helper.o \
 		drm_simple_kms_helper.o drm_modeset_helper.o \
-		drm_scdc_helper.o drm_gem_framebuffer_helper.o
+		drm_scdc_helper.o drm_gem_framebuffer_helper.o \
+		drm_atomic_state_helper.o
 
 drm_kms_helper-$(CONFIG_DRM_PANEL_BRIDGE) += bridge/panel.o
 drm_kms_helper-$(CONFIG_DRM_FBDEV_EMULATION) += drm_fb_helper.o
