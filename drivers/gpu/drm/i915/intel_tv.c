@@ -870,7 +870,7 @@ intel_tv_get_config(struct intel_encoder *encoder,
 	pipe_config->base.adjusted_mode.crtc_clock = pipe_config->port_clock;
 }
 
-static bool
+static int
 intel_tv_compute_config(struct intel_encoder *encoder,
 			struct intel_crtc_state *pipe_config,
 			struct drm_connector_state *conn_state)
@@ -880,11 +880,12 @@ intel_tv_compute_config(struct intel_encoder *encoder,
 		&pipe_config->base.adjusted_mode;
 
 	if (!tv_mode)
-		return false;
+		return -EINVAL;
 
 	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
-		return false;
+		return -EINVAL;
 
+	pipe_config->output_format = INTEL_OUTPUT_FORMAT_RGB;
 	adjusted_mode->crtc_clock = tv_mode->clock;
 	DRM_DEBUG_KMS("forcing bpc to 8 for TV\n");
 	pipe_config->pipe_bpp = 8*3;
@@ -897,7 +898,7 @@ intel_tv_compute_config(struct intel_encoder *encoder,
 	 * or whether userspace is doing something stupid.
 	 */
 
-	return true;
+	return 0;
 }
 
 static void
@@ -1377,17 +1378,10 @@ intel_tv_get_modes(struct drm_connector *connector)
 	return count;
 }
 
-static void
-intel_tv_destroy(struct drm_connector *connector)
-{
-	drm_connector_cleanup(connector);
-	kfree(connector);
-}
-
 static const struct drm_connector_funcs intel_tv_connector_funcs = {
 	.late_register = intel_connector_register,
 	.early_unregister = intel_connector_unregister,
-	.destroy = intel_tv_destroy,
+	.destroy = intel_connector_destroy,
 	.fill_modes = drm_helper_probe_single_connector_modes,
 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
 	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,

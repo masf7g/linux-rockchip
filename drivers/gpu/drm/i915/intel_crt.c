@@ -344,57 +344,61 @@ intel_crt_mode_valid(struct drm_connector *connector,
 	return MODE_OK;
 }
 
-static bool intel_crt_compute_config(struct intel_encoder *encoder,
-				     struct intel_crtc_state *pipe_config,
-				     struct drm_connector_state *conn_state)
+static int intel_crt_compute_config(struct intel_encoder *encoder,
+				    struct intel_crtc_state *pipe_config,
+				    struct drm_connector_state *conn_state)
 {
 	struct drm_display_mode *adjusted_mode =
 		&pipe_config->base.adjusted_mode;
 
 	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
-		return false;
+		return -EINVAL;
 
-	return true;
+	pipe_config->output_format = INTEL_OUTPUT_FORMAT_RGB;
+
+	return 0;
 }
 
-static bool pch_crt_compute_config(struct intel_encoder *encoder,
-				   struct intel_crtc_state *pipe_config,
-				   struct drm_connector_state *conn_state)
+static int pch_crt_compute_config(struct intel_encoder *encoder,
+				  struct intel_crtc_state *pipe_config,
+				  struct drm_connector_state *conn_state)
 {
 	struct drm_display_mode *adjusted_mode =
 		&pipe_config->base.adjusted_mode;
 
 	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
-		return false;
+		return -EINVAL;
 
 	pipe_config->has_pch_encoder = true;
+	pipe_config->output_format = INTEL_OUTPUT_FORMAT_RGB;
 
-	return true;
+	return 0;
 }
 
-static bool hsw_crt_compute_config(struct intel_encoder *encoder,
-				   struct intel_crtc_state *pipe_config,
-				   struct drm_connector_state *conn_state)
+static int hsw_crt_compute_config(struct intel_encoder *encoder,
+				  struct intel_crtc_state *pipe_config,
+				  struct drm_connector_state *conn_state)
 {
 	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
 	struct drm_display_mode *adjusted_mode =
 		&pipe_config->base.adjusted_mode;
 
 	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
-		return false;
+		return -EINVAL;
 
 	/* HSW/BDW FDI limited to 4k */
 	if (adjusted_mode->crtc_hdisplay > 4096 ||
 	    adjusted_mode->crtc_hblank_start > 4096)
-		return false;
+		return -EINVAL;
 
 	pipe_config->has_pch_encoder = true;
+	pipe_config->output_format = INTEL_OUTPUT_FORMAT_RGB;
 
 	/* LPT FDI RX only supports 8bpc. */
 	if (HAS_PCH_LPT(dev_priv)) {
 		if (pipe_config->bw_constrained && pipe_config->pipe_bpp < 24) {
 			DRM_DEBUG_KMS("LPT only supports 24bpp\n");
-			return false;
+			return -EINVAL;
 		}
 
 		pipe_config->pipe_bpp = 24;
@@ -403,7 +407,7 @@ static bool hsw_crt_compute_config(struct intel_encoder *encoder,
 	/* FDI must always be 2.7 GHz */
 	pipe_config->port_clock = 135000 * 2;
 
-	return true;
+	return 0;
 }
 
 static bool intel_ironlake_crt_detect_hotplug(struct drm_connector *connector)
@@ -849,12 +853,6 @@ out:
 	return status;
 }
 
-static void intel_crt_destroy(struct drm_connector *connector)
-{
-	drm_connector_cleanup(connector);
-	kfree(connector);
-}
-
 static int intel_crt_get_modes(struct drm_connector *connector)
 {
 	struct drm_device *dev = connector->dev;
@@ -909,7 +907,7 @@ static const struct drm_connector_funcs intel_crt_connector_funcs = {
 	.fill_modes = drm_helper_probe_single_connector_modes,
 	.late_register = intel_connector_register,
 	.early_unregister = intel_connector_unregister,
-	.destroy = intel_crt_destroy,
+	.destroy = intel_connector_destroy,
 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
 	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
 };

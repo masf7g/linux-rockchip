@@ -244,7 +244,7 @@ fallback:
 
 void bio_uninit(struct bio *bio)
 {
-	bio_disassociate_task(bio);
+	bio_disassociate_blkg(bio);
 }
 EXPORT_SYMBOL(bio_uninit);
 
@@ -571,14 +571,13 @@ void bio_put(struct bio *bio)
 }
 EXPORT_SYMBOL(bio_put);
 
-inline int bio_phys_segments(struct request_queue *q, struct bio *bio)
+int bio_phys_segments(struct request_queue *q, struct bio *bio)
 {
 	if (unlikely(!bio_flagged(bio, BIO_SEG_VALID)))
 		blk_recount_segments(q, bio);
 
 	return bio->bi_phys_segments;
 }
-EXPORT_SYMBOL(bio_phys_segments);
 
 /**
  * 	__bio_clone_fast - clone a bio that shares the original bio's biovec
@@ -605,12 +604,12 @@ void __bio_clone_fast(struct bio *bio, struct bio *bio_src)
 	if (bio_flagged(bio_src, BIO_THROTTLED))
 		bio_set_flag(bio, BIO_THROTTLED);
 	bio->bi_opf = bio_src->bi_opf;
+	bio->bi_ioprio = bio_src->bi_ioprio;
 	bio->bi_write_hint = bio_src->bi_write_hint;
 	bio->bi_iter = bio_src->bi_iter;
 	bio->bi_io_vec = bio_src->bi_io_vec;
 
 	bio_clone_blkg_association(bio, bio_src);
-
 	blkcg_bio_issue_init(bio);
 }
 EXPORT_SYMBOL(__bio_clone_fast);
@@ -902,7 +901,6 @@ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(bio_iov_iter_get_pages);
 
 static void submit_bio_wait_endio(struct bio *bio)
 {
@@ -1256,12 +1254,14 @@ struct bio *bio_copy_user_iov(struct request_queue *q,
 	/*
 	 * success
 	 */
-	if (((iter->type & WRITE) && (!map_data || !map_data->null_mapped)) ||
+	if ((iov_iter_rw(iter) == WRITE && (!map_data || !map_data->null_mapped)) ||
 	    (map_data && map_data->from_user)) {
 		ret = bio_copy_from_iter(bio, iter);
 		if (ret)
 			goto cleanup;
 	} else {
+		if (bmd->is_our_pages)
+			zero_fill_bio(bio);
 		iov_iter_advance(iter, bio->bi_iter.bi_size);
 	}
 
@@ -1591,7 +1591,6 @@ void bio_set_pages_dirty(struct bio *bio)
 			set_page_dirty_lock(bvec->bv_page);
 	}
 }
-EXPORT_SYMBOL_GPL(bio_set_pages_dirty);
 
 static void bio_release_pages(struct bio *bio)
 {
@@ -1661,17 +1660,33 @@ defer:
 	spin_unlock_irqrestore(&bio_dirty_lock, flags);
 	schedule_work(&bio_dirty_work);
 }
-EXPORT_SYMBOL_GPL(bio_check_pages_dirty);
+
+void update_io_ticks(struct hd_struct *part, unsigned long now)
+{
+	unsigned long stamp;
+again:
+	stamp = READ_ONCE(part->stamp);
+	if (unlikely(stamp != now)) {
+		if (likely(cmpxchg(&part->stamp, stamp, now) == stamp)) {
+			__part_stat_add(part, io_ticks, 1);
+		}
+	}
+	if (part->partno) {
+		part = &part_to_disk(part)->part0;
+		goto again;
+	}
+}
 
 void generic_start_io_acct(struct request_queue *q, int op,
 			   unsigned long sectors, struct hd_struct *part)
 {
 	const int sgrp = op_stat_group(op);
-	int cpu = part_stat_lock();
 
-	part_round_stats(q, cpu, part);
-	part_stat_inc(cpu, part, ios[sgrp]);
-	part_stat_add(cpu, part, sectors[sgrp], sectors);
+	part_stat_lock();
+
+	update_io_ticks(part, jiffies);
+	part_stat_inc(part, ios[sgrp]);
+	part_stat_add(part, sectors[sgrp], sectors);
 	part_inc_in_flight(q, part, op_is_write(op));
 
 	part_stat_unlock();
@@ -1681,12 +1696,15 @@ EXPORT_SYMBOL(generic_start_io_acct);
 void generic_end_io_acct(struct request_queue *q, int req_op,
 			 struct hd_struct *part, unsigned long start_time)
 {
-	unsigned long duration = jiffies - start_time;
+	unsigned long now = jiffies;
+	unsigned long duration = now - start_time;
 	const int sgrp = op_stat_group(req_op);
-	int cpu = part_stat_lock();
 
-	part_stat_add(cpu, part, nsecs[sgrp], jiffies_to_nsecs(duration));
-	part_round_stats(q, cpu, part);
+	part_stat_lock();
+
+	update_io_ticks(part, now);
+	part_stat_add(part, nsecs[sgrp], jiffies_to_nsecs(duration));
+	part_stat_add(part, time_in_queue, duration);
 	part_dec_in_flight(q, part, op_is_write(req_op));
 
 	part_stat_unlock();
@@ -1957,11 +1975,26 @@ EXPORT_SYMBOL(bioset_init_from_src);
 #ifdef CONFIG_BLK_CGROUP
 
 /**
- * bio_associate_blkg - associate a bio with the a blkg
+ * bio_disassociate_blkg - puts back the blkg reference if associated
+ * @bio: target bio
+ *
+ * Helper to disassociate the blkg from @bio if a blkg is associated.
+ */
+void bio_disassociate_blkg(struct bio *bio)
+{
+	if (bio->bi_blkg) {
+		blkg_put(bio->bi_blkg);
+		bio->bi_blkg = NULL;
+	}
+}
+EXPORT_SYMBOL_GPL(bio_disassociate_blkg);
+
+/**
+ * __bio_associate_blkg - associate a bio with the a blkg
  * @bio: target bio
  * @blkg: the blkg to associate
  *
- * This tries to associate @bio with the specified blkg.  Association failure
+ * This tries to associate @bio with the specified @blkg.  Association failure
  * is handled by walking up the blkg tree.  Therefore, the blkg associated can
  * be anything between @blkg and the root_blkg.  This situation only happens
  * when a cgroup is dying and then the remaining bios will spill to the closest
@@ -1970,38 +2003,11 @@ EXPORT_SYMBOL(bioset_init_from_src);
  * A reference will be taken on the @blkg and will be released when @bio is
  * freed.
  */
-int bio_associate_blkg(struct bio *bio, struct blkcg_gq *blkg)
+static void __bio_associate_blkg(struct bio *bio, struct blkcg_gq *blkg)
 {
-	if (unlikely(bio->bi_blkg))
-		return -EBUSY;
+	bio_disassociate_blkg(bio);
+
 	bio->bi_blkg = blkg_tryget_closest(blkg);
-	return 0;
-}
-
-/**
- * __bio_associate_blkg_from_css - internal blkg association function
- *
- * This in the core association function that all association paths rely on.
- * A blkg reference is taken which is released upon freeing of the bio.
- */
-static int __bio_associate_blkg_from_css(struct bio *bio,
-					 struct cgroup_subsys_state *css)
-{
-	struct request_queue *q = bio->bi_disk->queue;
-	struct blkcg_gq *blkg;
-	int ret;
-
-	rcu_read_lock();
-
-	if (!css || !css->parent)
-		blkg = q->root_blkg;
-	else
-		blkg = blkg_lookup_create(css_to_blkcg(css), q);
-
-	ret = bio_associate_blkg(bio, blkg);
-
-	rcu_read_unlock();
-	return ret;
 }
 
 /**
@@ -2013,12 +2019,22 @@ static int __bio_associate_blkg_from_css(struct bio *bio,
  * request_queue of the @bio.  This falls back to the queue's root_blkg if
  * the association fails with the css.
  */
-int bio_associate_blkg_from_css(struct bio *bio,
-				struct cgroup_subsys_state *css)
+void bio_associate_blkg_from_css(struct bio *bio,
+				 struct cgroup_subsys_state *css)
 {
-	if (unlikely(bio->bi_blkg))
-		return -EBUSY;
-	return __bio_associate_blkg_from_css(bio, css);
+	struct request_queue *q = bio->bi_disk->queue;
+	struct blkcg_gq *blkg;
+
+	rcu_read_lock();
+
+	if (!css || !css->parent)
+		blkg = q->root_blkg;
+	else
+		blkg = blkg_lookup_create(css_to_blkcg(css), q);
+
+	__bio_associate_blkg(bio, blkg);
+
+	rcu_read_unlock();
 }
 EXPORT_SYMBOL_GPL(bio_associate_blkg_from_css);
 
@@ -2029,95 +2045,50 @@ EXPORT_SYMBOL_GPL(bio_associate_blkg_from_css);
  * @page: the page to lookup the blkcg from
  *
  * Associate @bio with the blkg from @page's owning memcg and the respective
- * request_queue.  If cgroup_e_css returns NULL, fall back to the queue's
+ * request_queue.  If cgroup_e_css returns %NULL, fall back to the queue's
  * root_blkg.
- *
- * Note: this must be called after bio has an associated device.
  */
-int bio_associate_blkg_from_page(struct bio *bio, struct page *page)
+void bio_associate_blkg_from_page(struct bio *bio, struct page *page)
 {
 	struct cgroup_subsys_state *css;
-	int ret;
 
-	if (unlikely(bio->bi_blkg))
-		return -EBUSY;
 	if (!page->mem_cgroup)
-		return 0;
+		return;
 
 	rcu_read_lock();
 
 	css = cgroup_e_css(page->mem_cgroup->css.cgroup, &io_cgrp_subsys);
-
-	ret = __bio_associate_blkg_from_css(bio, css);
+	bio_associate_blkg_from_css(bio, css);
 
 	rcu_read_unlock();
-	return ret;
 }
 #endif /* CONFIG_MEMCG */
 
 /**
- * bio_associate_create_blkg - associate a bio with a blkg from q
- * @q: request_queue where bio is going
+ * bio_associate_blkg - associate a bio with a blkg
  * @bio: target bio
  *
- * Associate @bio with the blkg found from the bio's css and the request_queue.
- * If one is not found, bio_lookup_blkg creates the blkg.  This falls back to
- * the queue's root_blkg if association fails.
+ * Associate @bio with the blkg found from the bio's css and request_queue.
+ * If one is not found, bio_lookup_blkg() creates the blkg.  If a blkg is
+ * already associated, the css is reused and association redone as the
+ * request_queue may have changed.
  */
-int bio_associate_create_blkg(struct request_queue *q, struct bio *bio)
+void bio_associate_blkg(struct bio *bio)
 {
 	struct cgroup_subsys_state *css;
-	int ret = 0;
-
-	/* someone has already associated this bio with a blkg */
-	if (bio->bi_blkg)
-		return ret;
 
 	rcu_read_lock();
 
-	css = blkcg_css();
+	if (bio->bi_blkg)
+		css = &bio_blkcg(bio)->css;
+	else
+		css = blkcg_css();
 
-	ret = __bio_associate_blkg_from_css(bio, css);
+	bio_associate_blkg_from_css(bio, css);
 
 	rcu_read_unlock();
-	return ret;
 }
-
-/**
- * bio_reassociate_blkg - reassociate a bio with a blkg from q
- * @q: request_queue where bio is going
- * @bio: target bio
- *
- * When submitting a bio, multiple recursive calls to make_request() may occur.
- * This causes the initial associate done in blkcg_bio_issue_check() to be
- * incorrect and reference the prior request_queue.  This performs reassociation
- * when this situation happens.
- */
-int bio_reassociate_blkg(struct request_queue *q, struct bio *bio)
-{
-	if (bio->bi_blkg) {
-		blkg_put(bio->bi_blkg);
-		bio->bi_blkg = NULL;
-	}
-
-	return bio_associate_create_blkg(q, bio);
-}
-
-/**
- * bio_disassociate_task - undo bio_associate_current()
- * @bio: target bio
- */
-void bio_disassociate_task(struct bio *bio)
-{
-	if (bio->bi_ioc) {
-		put_io_context(bio->bi_ioc);
-		bio->bi_ioc = NULL;
-	}
-	if (bio->bi_blkg) {
-		blkg_put(bio->bi_blkg);
-		bio->bi_blkg = NULL;
-	}
-}
+EXPORT_SYMBOL_GPL(bio_associate_blkg);
 
 /**
  * bio_clone_blkg_association - clone blkg association from src to dst bio
@@ -2126,8 +2097,12 @@ void bio_disassociate_task(struct bio *bio)
  */
 void bio_clone_blkg_association(struct bio *dst, struct bio *src)
 {
+	rcu_read_lock();
+
 	if (src->bi_blkg)
-		bio_associate_blkg(dst, src->bi_blkg);
+		__bio_associate_blkg(dst, src->bi_blkg);
+
+	rcu_read_unlock();
 }
 EXPORT_SYMBOL_GPL(bio_clone_blkg_association);
 #endif /* CONFIG_BLK_CGROUP */

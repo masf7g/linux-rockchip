@@ -1165,28 +1165,13 @@ static void mvpp22_gop_setup_irq(struct mvpp2_port *port)
  */
 static int mvpp22_comphy_init(struct mvpp2_port *port)
 {
-	enum phy_mode mode;
 	int ret;
 
 	if (!port->comphy)
 		return 0;
 
-	switch (port->phy_interface) {
-	case PHY_INTERFACE_MODE_SGMII:
-	case PHY_INTERFACE_MODE_1000BASEX:
-		mode = PHY_MODE_SGMII;
-		break;
-	case PHY_INTERFACE_MODE_2500BASEX:
-		mode = PHY_MODE_2500SGMII;
-		break;
-	case PHY_INTERFACE_MODE_10GKR:
-		mode = PHY_MODE_10GKR;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	ret = phy_set_mode(port->comphy, mode);
+	ret = phy_set_mode_ext(port->comphy, PHY_MODE_ETHERNET,
+			       port->phy_interface);
 	if (ret)
 		return ret;
 
@@ -2059,9 +2044,9 @@ static int mvpp2_aggr_txq_init(struct platform_device *pdev,
 	u32 txq_dma;
 
 	/* Allocate memory for TX descriptors */
-	aggr_txq->descs = dma_zalloc_coherent(&pdev->dev,
-				MVPP2_AGGR_TXQ_SIZE * MVPP2_DESC_ALIGNED_SIZE,
-				&aggr_txq->descs_dma, GFP_KERNEL);
+	aggr_txq->descs = dma_alloc_coherent(&pdev->dev,
+					     MVPP2_AGGR_TXQ_SIZE * MVPP2_DESC_ALIGNED_SIZE,
+					     &aggr_txq->descs_dma, GFP_KERNEL);
 	if (!aggr_txq->descs)
 		return -ENOMEM;
 
@@ -3298,24 +3283,30 @@ static int mvpp2_irqs_init(struct mvpp2_port *port)
 	for (i = 0; i < port->nqvecs; i++) {
 		struct mvpp2_queue_vector *qv = port->qvecs + i;
 
-		if (qv->type == MVPP2_QUEUE_VECTOR_PRIVATE)
+		if (qv->type == MVPP2_QUEUE_VECTOR_PRIVATE) {
+			qv->mask = kzalloc(cpumask_size(), GFP_KERNEL);
+			if (!qv->mask) {
+				err = -ENOMEM;
+				goto err;
+			}
+
 			irq_set_status_flags(qv->irq, IRQ_NO_BALANCING);
+		}
 
 		err = request_irq(qv->irq, mvpp2_isr, 0, port->dev->name, qv);
 		if (err)
 			goto err;
 
 		if (qv->type == MVPP2_QUEUE_VECTOR_PRIVATE) {
-			unsigned long mask = 0;
 			unsigned int cpu;
 
 			for_each_present_cpu(cpu) {
 				if (mvpp2_cpu_to_thread(port->priv, cpu) ==
 				    qv->sw_thread_id)
-					mask |= BIT(cpu);
+					cpumask_set_cpu(cpu, qv->mask);
 			}
 
-			irq_set_affinity_hint(qv->irq, to_cpumask(&mask));
+			irq_set_affinity_hint(qv->irq, qv->mask);
 		}
 	}
 
@@ -3325,6 +3316,8 @@ err:
 		struct mvpp2_queue_vector *qv = port->qvecs + i;
 
 		irq_set_affinity_hint(qv->irq, NULL);
+		kfree(qv->mask);
+		qv->mask = NULL;
 		free_irq(qv->irq, qv);
 	}
 
@@ -3339,6 +3332,8 @@ static void mvpp2_irqs_deinit(struct mvpp2_port *port)
 		struct mvpp2_queue_vector *qv = port->qvecs + i;
 
 		irq_set_affinity_hint(qv->irq, NULL);
+		kfree(qv->mask);
+		qv->mask = NULL;
 		irq_clear_status_flags(qv->irq, IRQ_NO_BALANCING);
 		free_irq(qv->irq, qv);
 	}
@@ -4365,7 +4360,26 @@ static void mvpp2_phylink_validate(struct net_device *dev,
 				   unsigned long *supported,
 				   struct phylink_link_state *state)
 {
+	struct mvpp2_port *port = netdev_priv(dev);
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(mask) = { 0, };
+
+	/* Invalid combinations */
+	switch (state->interface) {
+	case PHY_INTERFACE_MODE_10GKR:
+	case PHY_INTERFACE_MODE_XAUI:
+		if (port->gop_id != 0)
+			goto empty_set;
+		break;
+	case PHY_INTERFACE_MODE_RGMII:
+	case PHY_INTERFACE_MODE_RGMII_ID:
+	case PHY_INTERFACE_MODE_RGMII_RXID:
+	case PHY_INTERFACE_MODE_RGMII_TXID:
+		if (port->gop_id == 0)
+			goto empty_set;
+		break;
+	default:
+		break;
+	}
 
 	phylink_set(mask, Autoneg);
 	phylink_set_port_modes(mask);
@@ -4374,30 +4388,45 @@ static void mvpp2_phylink_validate(struct net_device *dev,
 
 	switch (state->interface) {
 	case PHY_INTERFACE_MODE_10GKR:
-		phylink_set(mask, 10000baseCR_Full);
-		phylink_set(mask, 10000baseSR_Full);
-		phylink_set(mask, 10000baseLR_Full);
-		phylink_set(mask, 10000baseLRM_Full);
-		phylink_set(mask, 10000baseER_Full);
-		phylink_set(mask, 10000baseKR_Full);
+	case PHY_INTERFACE_MODE_XAUI:
+	case PHY_INTERFACE_MODE_NA:
+		if (port->gop_id == 0) {
+			phylink_set(mask, 10000baseT_Full);
+			phylink_set(mask, 10000baseCR_Full);
+			phylink_set(mask, 10000baseSR_Full);
+			phylink_set(mask, 10000baseLR_Full);
+			phylink_set(mask, 10000baseLRM_Full);
+			phylink_set(mask, 10000baseER_Full);
+			phylink_set(mask, 10000baseKR_Full);
+		}
 		/* Fall-through */
-	default:
+	case PHY_INTERFACE_MODE_RGMII:
+	case PHY_INTERFACE_MODE_RGMII_ID:
+	case PHY_INTERFACE_MODE_RGMII_RXID:
+	case PHY_INTERFACE_MODE_RGMII_TXID:
+	case PHY_INTERFACE_MODE_SGMII:
 		phylink_set(mask, 10baseT_Half);
 		phylink_set(mask, 10baseT_Full);
 		phylink_set(mask, 100baseT_Half);
 		phylink_set(mask, 100baseT_Full);
-		phylink_set(mask, 10000baseT_Full);
 		/* Fall-through */
 	case PHY_INTERFACE_MODE_1000BASEX:
 	case PHY_INTERFACE_MODE_2500BASEX:
 		phylink_set(mask, 1000baseT_Full);
 		phylink_set(mask, 1000baseX_Full);
 		phylink_set(mask, 2500baseX_Full);
+		break;
+	default:
+		goto empty_set;
 	}
 
 	bitmap_and(supported, supported, mask, __ETHTOOL_LINK_MODE_MASK_NBITS);
 	bitmap_and(state->advertising, state->advertising, mask,
 		   __ETHTOOL_LINK_MODE_MASK_NBITS);
+	return;
+
+empty_set:
+	bitmap_zero(supported, __ETHTOOL_LINK_MODE_MASK_NBITS);
 }
 
 static void mvpp22_xlg_link_state(struct mvpp2_port *port,
@@ -5211,6 +5240,8 @@ static int mvpp2_probe(struct platform_device *pdev)
 	if (has_acpi_companion(&pdev->dev)) {
 		acpi_id = acpi_match_device(pdev->dev.driver->acpi_match_table,
 					    &pdev->dev);
+		if (!acpi_id)
+			return -EINVAL;
 		priv->hw_version = (unsigned long)acpi_id->driver_data;
 	} else {
 		priv->hw_version =

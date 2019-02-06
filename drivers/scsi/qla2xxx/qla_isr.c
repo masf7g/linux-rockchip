@@ -25,7 +25,7 @@ static int qla2x00_error_entry(scsi_qla_host_t *, struct rsp_que *,
 
 /**
  * qla2100_intr_handler() - Process interrupts for the ISP2100 and ISP2200.
- * @irq:
+ * @irq: interrupt number
  * @dev_id: SCSI driver HA context
  *
  * Called by system whenever the host adapter generates an interrupt.
@@ -144,7 +144,7 @@ qla2x00_check_reg16_for_disconnect(scsi_qla_host_t *vha, uint16_t reg)
 
 /**
  * qla2300_intr_handler() - Process interrupts for the ISP23xx and ISP63xx.
- * @irq:
+ * @irq: interrupt number
  * @dev_id: SCSI driver HA context
  *
  * Called by system whenever the host adapter generates an interrupt.
@@ -3109,7 +3109,7 @@ done:
 
 /**
  * qla24xx_intr_handler() - Process interrupts for the ISP23xx and ISP24xx.
- * @irq:
+ * @irq: interrupt number
  * @dev_id: SCSI driver HA context
  *
  * Called by system whenever the host adapter generates an interrupt.
@@ -3446,6 +3446,7 @@ qla24xx_enable_msix(struct qla_hw_data *ha, struct rsp_que *rsp)
 			    "Adjusted Max no of queues pairs: %d.\n", ha->max_qpairs);
 		}
 	}
+	vha->irq_offset = desc.pre_vectors;
 	ha->msix_entries = kcalloc(ha->msix_count,
 				   sizeof(struct qla_msix_entry),
 				   GFP_KERNEL);

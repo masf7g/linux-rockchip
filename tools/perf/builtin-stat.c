@@ -383,30 +383,26 @@ static bool perf_evsel__should_store_id(struct perf_evsel *counter)
 	return STAT_RECORD || counter->attr.read_format & PERF_FORMAT_ID;
 }
 
-static struct perf_evsel *perf_evsel__reset_weak_group(struct perf_evsel *evsel)
+static bool is_target_alive(struct target *_target,
+			    struct thread_map *threads)
 {
-	struct perf_evsel *c2, *leader;
-	bool is_open = true;
+	struct stat st;
+	int i;
 
-	leader = evsel->leader;
-	pr_debug("Weak group for %s/%d failed\n",
-			leader->name, leader->nr_members);
+	if (!target__has_task(_target))
+		return true;
 
-	/*
-	 * for_each_group_member doesn't work here because it doesn't
-	 * include the first entry.
-	 */
-	evlist__for_each_entry(evsel_list, c2) {
-		if (c2 == evsel)
-			is_open = false;
-		if (c2->leader == leader) {
-			if (is_open)
-				perf_evsel__close(c2);
-			c2->leader = c2;
-			c2->nr_members = 0;
-		}
+	for (i = 0; i < threads->nr; i++) {
+		char path[PATH_MAX];
+
+		scnprintf(path, PATH_MAX, "%s/%d", procfs__mountpoint(),
+			  threads->map[i].pid);
+
+		if (!stat(path, &st))
+			return true;
 	}
-	return leader;
+
+	return false;
 }
 
 static int __run_perf_stat(int argc, const char **argv, int run_idx)
@@ -455,7 +451,7 @@ try_again:
 			if ((errno == EINVAL || errno == EBADF) &&
 			    counter->leader != counter &&
 			    counter->weak_group) {
-				counter = perf_evsel__reset_weak_group(counter);
+				counter = perf_evlist__reset_weak_group(evsel_list, counter);
 				goto try_again;
 			}
 
@@ -565,7 +561,8 @@ try_again:
 					break;
 			}
 		}
-		wait4(child_pid, &status, 0, &stat_config.ru_data);
+		if (child_pid != -1)
+			wait4(child_pid, &status, 0, &stat_config.ru_data);
 
 		if (workload_exec_errno) {
 			const char *emsg = str_error_r(workload_exec_errno, msg, sizeof(msg));
@@ -579,6 +576,8 @@ try_again:
 		enable_counters();
 		while (!done) {
 			nanosleep(&ts, NULL);
+			if (!is_target_alive(&target, evsel_list->threads))
+				break;
 			if (timeout)
 				break;
 			if (interval) {
@@ -711,7 +710,7 @@ static int parse_metric_groups(const struct option *opt,
 	return metricgroup__parse_groups(opt, str, &stat_config.metric_events);
 }
 
-static const struct option stat_options[] = {
+static struct option stat_options[] = {
 	OPT_BOOLEAN('T', "transaction", &transaction_run,
 		    "hardware transaction statistics"),
 	OPT_CALLBACK('e', "event", &evsel_list, "event",
@@ -1601,6 +1600,12 @@ int cmd_stat(int argc, const char **argv)
 		return -ENOMEM;
 
 	parse_events__shrink_config_terms();
+
+	/* String-parsing callback-based options would segfault when negated */
+	set_option_flag(stat_options, 'e', "event", PARSE_OPT_NONEG);
+	set_option_flag(stat_options, 'M', "metrics", PARSE_OPT_NONEG);
+	set_option_flag(stat_options, 'G', "cgroup", PARSE_OPT_NONEG);
+
 	argc = parse_options_subcommand(argc, argv, stat_options, stat_subcommands,
 					(const char **) stat_usage,
 					PARSE_OPT_STOP_AT_NON_OPTION);

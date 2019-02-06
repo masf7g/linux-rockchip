@@ -365,7 +365,7 @@ static int dw_hdmi_phy_init(struct dw_hdmi *hdmi, void *data,
 	unsigned int wr_clk =
 		readl_relaxed(priv->io_base + _REG(VPU_HDMI_SETTING));
 
-	DRM_DEBUG_DRIVER("%d:\"%s\"\n", mode->base.id, mode->name);
+	DRM_DEBUG_DRIVER("\"%s\"\n", mode->name);
 
 	/* Enable clocks */
 	regmap_update_bits(priv->hhi, HHI_HDMI_CLK_CNTL, 0xffff, 0x100);
@@ -555,12 +555,7 @@ dw_hdmi_mode_valid(struct drm_connector *connector,
 	int vic = drm_match_cea_mode(mode);
 	enum drm_mode_status status;
 
-	DRM_DEBUG_DRIVER("Modeline %d:\"%s\" %d %d %d %d %d %d %d %d %d %d 0x%x 0x%x\n",
-		mode->base.id, mode->name, mode->vrefresh, mode->clock,
-		mode->hdisplay, mode->hsync_start,
-		mode->hsync_end, mode->htotal,
-		mode->vdisplay, mode->vsync_start,
-		mode->vsync_end, mode->vtotal, mode->type, mode->flags);
+	DRM_DEBUG_DRIVER("Modeline " DRM_MODE_FMT "\n", DRM_MODE_ARG(mode));
 
 	/* Check against non-VIC supported modes */
 	if (!vic) {
@@ -594,17 +589,7 @@ dw_hdmi_mode_valid(struct drm_connector *connector,
 	dev_dbg(connector->dev->dev, "%s: vclk:%d venc=%d hdmi=%d\n", __func__,
 		vclk_freq, venc_freq, hdmi_freq);
 
-	/* Finally filter by configurable vclk frequencies for VIC modes */
-	switch (vclk_freq) {
-	case 54000:
-	case 74250:
-	case 148500:
-	case 297000:
-	case 594000:
-		return MODE_OK;
-	}
-
-	return MODE_CLOCK_RANGE;
+	return meson_vclk_vic_supported_freq(vclk_freq);
 }
 
 /* Encoder */
@@ -660,8 +645,7 @@ static void meson_venc_hdmi_encoder_mode_set(struct drm_encoder *encoder,
 	struct meson_drm *priv = dw_hdmi->priv;
 	int vic = drm_match_cea_mode(mode);
 
-	DRM_DEBUG_DRIVER("%d:\"%s\" vic %d\n",
-			 mode->base.id, mode->name, vic);
+	DRM_DEBUG_DRIVER("\"%s\" vic %d\n", mode->name, vic);
 
 	/* VENC + VENC-DVI Mode setup */
 	meson_venc_hdmi_mode_set(priv, vic, mode);
@@ -706,6 +690,7 @@ static const struct regmap_config meson_dw_hdmi_regmap_config = {
 	.reg_read = meson_dw_hdmi_reg_read,
 	.reg_write = meson_dw_hdmi_reg_write,
 	.max_register = 0x10000,
+	.fast_io = true,
 };
 
 static bool meson_hdmi_connector_is_available(struct device *dev)

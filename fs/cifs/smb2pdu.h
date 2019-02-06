@@ -842,6 +842,41 @@ struct fsctl_get_integrity_information_rsp {
 /* Integrity flags for above */
 #define FSCTL_INTEGRITY_FLAG_CHECKSUM_ENFORCEMENT_OFF	0x00000001
 
+/* Reparse structures - see MS-FSCC 2.1.2 */
+
+/* struct fsctl_reparse_info_req is empty, only response structs (see below) */
+
+struct reparse_data_buffer {
+	__le32	ReparseTag;
+	__le16	ReparseDataLength;
+	__u16	Reserved;
+	__u8	DataBuffer[0]; /* Variable Length */
+} __packed;
+
+struct reparse_guid_data_buffer {
+	__le32	ReparseTag;
+	__le16	ReparseDataLength;
+	__u16	Reserved;
+	__u8	ReparseGuid[16];
+	__u8	DataBuffer[0]; /* Variable Length */
+} __packed;
+
+struct reparse_mount_point_data_buffer {
+	__le32	ReparseTag;
+	__le16	ReparseDataLength;
+	__u16	Reserved;
+	__le16	SubstituteNameOffset;
+	__le16	SubstituteNameLength;
+	__le16	PrintNameOffset;
+	__le16	PrintNameLength;
+	__u8	PathBuffer[0]; /* Variable Length */
+} __packed;
+
+/* See MS-FSCC 2.1.2.4 and cifspdu.h for struct reparse_symlink_data */
+
+/* See MS-FSCC 2.1.2.6 and cifspdu.h for struct reparse_posix_data */
+
+
 /* See MS-DFSC 2.2.2 */
 struct fsctl_get_dfs_referral_req {
 	__le16 MaxReferralLevel;
@@ -863,7 +898,7 @@ struct validate_negotiate_info_req {
 	__u8   Guid[SMB2_CLIENT_GUID_SIZE];
 	__le16 SecurityMode;
 	__le16 DialectCount;
-	__le16 Dialects[3]; /* BB expand this if autonegotiate > 3 dialects */
+	__le16 Dialects[4]; /* BB expand this if autonegotiate > 4 dialects */
 } __packed;
 
 struct validate_negotiate_info_rsp {
@@ -1363,7 +1398,6 @@ struct smb2_file_link_info { /* encoding of request for level 11 */
 	char   FileName[0];     /* Name to be assigned to new link */
 } __packed; /* level 11 Set */
 
-#define SMB2_MIN_EA_BUF  2048
 #define SMB2_MAX_EA_BUF 65536
 
 struct smb2_file_full_ea_info { /* encoding of response for level 15 */

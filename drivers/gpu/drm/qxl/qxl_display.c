@@ -48,8 +48,8 @@ static int qxl_alloc_client_monitors_config(struct qxl_device *qdev,
 	}
 	if (!qdev->client_monitors_config) {
 		qdev->client_monitors_config = kzalloc(
-				sizeof(struct qxl_monitors_config) +
-				sizeof(struct qxl_head) * count, GFP_KERNEL);
+				struct_size(qdev->client_monitors_config,
+				heads, count), GFP_KERNEL);
 		if (!qdev->client_monitors_config)
 			return -ENOMEM;
 	}
@@ -622,9 +622,13 @@ static void qxl_cursor_atomic_update(struct drm_plane *plane,
 		if (ret)
 			goto out_kunmap;
 
-		ret = qxl_release_reserve_list(release, true);
+		ret = qxl_bo_pin(cursor_bo);
 		if (ret)
 			goto out_free_bo;
+
+		ret = qxl_release_reserve_list(release, true);
+		if (ret)
+			goto out_unpin;
 
 		ret = qxl_bo_kmap(cursor_bo, (void **)&cursor);
 		if (ret)
@@ -670,15 +674,17 @@ static void qxl_cursor_atomic_update(struct drm_plane *plane,
 	qxl_push_cursor_ring_release(qdev, release, QXL_CMD_CURSOR, false);
 	qxl_release_fence_buffer_objects(release);
 
-	if (old_cursor_bo)
-		qxl_bo_unref(&old_cursor_bo);
-
+	if (old_cursor_bo != NULL)
+		qxl_bo_unpin(old_cursor_bo);
+	qxl_bo_unref(&old_cursor_bo);
 	qxl_bo_unref(&cursor_bo);
 
 	return;
 
 out_backoff:
 	qxl_release_backoff_reserve_list(release);
+out_unpin:
+	qxl_bo_unpin(cursor_bo);
 out_free_bo:
 	qxl_bo_unref(&cursor_bo);
 out_kunmap:
@@ -757,7 +763,7 @@ static int qxl_plane_prepare_fb(struct drm_plane *plane,
 		}
 	}
 
-	ret = qxl_bo_pin(user_bo, QXL_GEM_DOMAIN_CPU, NULL);
+	ret = qxl_bo_pin(user_bo);
 	if (ret)
 		return ret;
 
@@ -1004,7 +1010,6 @@ static void qxl_conn_destroy(struct drm_connector *connector)
 }
 
 static const struct drm_connector_funcs qxl_connector_funcs = {
-	.dpms = drm_helper_connector_dpms,
 	.detect = qxl_conn_detect,
 	.fill_modes = drm_helper_probe_single_connector_modes,
 	.destroy = qxl_conn_destroy,
@@ -1104,7 +1109,7 @@ int qxl_create_monitors_object(struct qxl_device *qdev)
 	}
 	qdev->monitors_config_bo = gem_to_qxl_bo(gobj);
 
-	ret = qxl_bo_pin(qdev->monitors_config_bo, QXL_GEM_DOMAIN_VRAM, NULL);
+	ret = qxl_bo_pin(qdev->monitors_config_bo);
 	if (ret)
 		return ret;
 

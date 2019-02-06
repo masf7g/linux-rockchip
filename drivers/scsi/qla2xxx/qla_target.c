@@ -2379,20 +2379,20 @@ void qlt_xmit_tm_rsp(struct qla_tgt_mgmt_cmd *mcmd)
 	}
 
 	if (mcmd->flags == QLA24XX_MGMT_SEND_NACK) {
-		if (mcmd->orig_iocb.imm_ntfy.u.isp24.status_subcode ==
-		    ELS_LOGO ||
-		    mcmd->orig_iocb.imm_ntfy.u.isp24.status_subcode ==
-		    ELS_PRLO ||
-		    mcmd->orig_iocb.imm_ntfy.u.isp24.status_subcode ==
-		    ELS_TPRLO) {
+		switch (mcmd->orig_iocb.imm_ntfy.u.isp24.status_subcode) {
+		case ELS_LOGO:
+		case ELS_PRLO:
+		case ELS_TPRLO:
 			ql_dbg(ql_dbg_disc, vha, 0x2106,
 			    "TM response logo %phC status %#x state %#x",
 			    mcmd->sess->port_name, mcmd->fc_tm_rsp,
 			    mcmd->flags);
 			qlt_schedule_sess_for_deletion(mcmd->sess);
-		} else {
+			break;
+		default:
 			qlt_send_notify_ack(vha->hw->base_qpair,
 			    &mcmd->orig_iocb.imm_ntfy, 0, 0, 0, 0, 0, 0);
+			break;
 		}
 	} else {
 		if (mcmd->orig_iocb.atio.u.raw.entry_type == ABTS_RECV_24XX) {
@@ -2660,9 +2660,9 @@ static void qlt_load_cont_data_segments(struct qla_tgt_prm *prm)
 		    cnt < QLA_TGT_DATASEGS_PER_CONT_24XX && prm->seg_cnt;
 		    cnt++, prm->seg_cnt--) {
 			*dword_ptr++ =
-			    cpu_to_le32(pci_dma_lo32
+			    cpu_to_le32(lower_32_bits
 				(sg_dma_address(prm->sg)));
-			*dword_ptr++ = cpu_to_le32(pci_dma_hi32
+			*dword_ptr++ = cpu_to_le32(upper_32_bits
 			    (sg_dma_address(prm->sg)));
 			*dword_ptr++ = cpu_to_le32(sg_dma_len(prm->sg));
 
@@ -2704,9 +2704,9 @@ static void qlt_load_data_segments(struct qla_tgt_prm *prm)
 	    (cnt < QLA_TGT_DATASEGS_PER_CMD_24XX) && prm->seg_cnt;
 	    cnt++, prm->seg_cnt--) {
 		*dword_ptr++ =
-		    cpu_to_le32(pci_dma_lo32(sg_dma_address(prm->sg)));
+		    cpu_to_le32(lower_32_bits(sg_dma_address(prm->sg)));
 
-		*dword_ptr++ = cpu_to_le32(pci_dma_hi32(
+		*dword_ptr++ = cpu_to_le32(upper_32_bits(
 			sg_dma_address(prm->sg)));
 
 		*dword_ptr++ = cpu_to_le32(sg_dma_len(prm->sg));
@@ -4540,7 +4540,7 @@ static int qlt_issue_task_mgmt(struct fc_port *sess, u64 lun,
 	case QLA_TGT_CLEAR_TS:
 	case QLA_TGT_ABORT_TS:
 		abort_cmds_for_lun(vha, lun, a->u.isp24.fcp_hdr.s_id);
-		/* drop through */
+		/* fall through */
 	case QLA_TGT_CLEAR_ACA:
 		h = qlt_find_qphint(vha, mcmd->unpacked_lun);
 		mcmd->qpair = h->qpair;
@@ -6598,9 +6598,9 @@ static void qlt_lport_dump(struct scsi_qla_host *vha, u64 wwpn,
  * qla_tgt_lport_register - register lport with external module
  *
  * @target_lport_ptr: pointer for tcm_qla2xxx specific lport data
- * @phys_wwpn:
- * @npiv_wwpn:
- * @npiv_wwnn:
+ * @phys_wwpn: physical port WWPN
+ * @npiv_wwpn: NPIV WWPN
+ * @npiv_wwnn: NPIV WWNN
  * @callback:  lport initialization callback for tcm_qla2xxx code
  */
 int qlt_lport_register(void *target_lport_ptr, u64 phys_wwpn,

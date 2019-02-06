@@ -46,6 +46,7 @@ enum term_type {
 	PERF_EVSEL__CONFIG_TERM_STACK_USER,
 	PERF_EVSEL__CONFIG_TERM_INHERIT,
 	PERF_EVSEL__CONFIG_TERM_MAX_STACK,
+	PERF_EVSEL__CONFIG_TERM_MAX_EVENTS,
 	PERF_EVSEL__CONFIG_TERM_OVERWRITE,
 	PERF_EVSEL__CONFIG_TERM_DRV_CFG,
 	PERF_EVSEL__CONFIG_TERM_BRANCH,
@@ -65,6 +66,7 @@ struct perf_evsel_config_term {
 		bool	inherit;
 		bool	overwrite;
 		char	*branch;
+		unsigned long max_events;
 	} val;
 	bool weak;
 };
@@ -99,10 +101,12 @@ struct perf_evsel {
 	struct perf_counts	*prev_raw_counts;
 	int			idx;
 	u32			ids;
+	unsigned long		max_events;
+	unsigned long		nr_events_printed;
 	char			*name;
 	double			scale;
 	const char		*unit;
-	struct tep_event_format	*tp_format;
+	struct tep_event	*tp_format;
 	off_t			id_offset;
 	struct perf_stat_evsel  *stats;
 	void			*priv;
@@ -119,6 +123,7 @@ struct perf_evsel {
 	bool			snapshot;
 	bool 			supported;
 	bool 			needs_swap;
+	bool 			disabled;
 	bool			no_aux_samples;
 	bool			immediate;
 	bool			system_wide;
@@ -211,7 +216,7 @@ static inline struct perf_evsel *perf_evsel__newtp(const char *sys, const char *
 
 struct perf_evsel *perf_evsel__new_cycles(bool precise);
 
-struct tep_event_format *event_format__new(const char *sys, const char *name);
+struct tep_event *event_format__new(const char *sys, const char *name);
 
 void perf_evsel__init(struct perf_evsel *evsel,
 		      struct perf_event_attr *attr, int idx);
