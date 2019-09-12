@@ -396,6 +396,7 @@ static void dwc2_wakeup_from_lpm_l1(struct dwc2_hsotg *hsotg)
 static void dwc2_handle_wakeup_detected_intr(struct dwc2_hsotg *hsotg)
 {
 	int ret;
+	struct device_node *np = hsotg->dev->of_node;
 
 	/* Clear interrupt */
 	dwc2_writel(hsotg, GINTSTS_WKUPINT, GINTSTS);
@@ -446,6 +447,15 @@ static void dwc2_handle_wakeup_detected_intr(struct dwc2_hsotg *hsotg)
 			 */
 			if (hsotg->reset_phy_on_wake)
 				dwc2_host_schedule_phy_reset(hsotg);
+
+			/*
+			 * It is a quirk in Rockchip RK3288, causing by
+			 * a hardware bug. This will propagate out and
+			 * eventually we'll re-enumerate the device. 
+			 * Not great but the best we can do 
+			 */
+			if (of_device_is_compatible(np, "rockchip,rk3288-usb"))
+				schedule_work(&hsotg->phy_rst_work);
 
 			mod_timer(&hsotg->wkp_timer,
 				  jiffies + msecs_to_jiffies(71));

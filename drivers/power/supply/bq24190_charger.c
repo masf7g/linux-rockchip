@@ -1796,6 +1796,12 @@ static int bq24190_probe(struct i2c_client *client,
 	if (ret < 0)
 		goto out_charger;
 
+	ret = bq24190_sysfs_create_group(bdi);
+	if (ret < 0) {
+		dev_err(dev, "Can't create sysfs entries\n");
+		goto out_charger;
+	}
+
 	bdi->initialized = true;
 
 	ret = devm_request_threaded_irq(dev, client->irq, NULL,
