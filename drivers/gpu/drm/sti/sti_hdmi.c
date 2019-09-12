@@ -13,10 +13,13 @@
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 
-#include <drm/drmP.h>
 #include <drm/drm_atomic_helper.h>
-#include <drm/drm_crtc_helper.h>
+#include <drm/drm_debugfs.h>
+#include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
+#include <drm/drm_file.h>
+#include <drm/drm_print.h>
+#include <drm/drm_probe_helper.h>
 
 #include <sound/hdmi-codec.h>
 
@@ -918,8 +921,8 @@ static void sti_hdmi_pre_enable(struct drm_bridge *bridge)
 }
 
 static void sti_hdmi_set_mode(struct drm_bridge *bridge,
-		struct drm_display_mode *mode,
-		struct drm_display_mode *adjusted_mode)
+			      const struct drm_display_mode *mode,
+			      const struct drm_display_mode *adjusted_mode)
 {
 	struct sti_hdmi *hdmi = bridge->driver_private;
 	int ret;

@@ -1,13 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2015-2018, The Linux Foundation. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
@@ -263,13 +255,13 @@ static const struct dpu_format dpu_format_map[] = {
 
 	INTERLEAVED_RGB_FMT(RGB565,
 		0, COLOR_5BIT, COLOR_6BIT, COLOR_5BIT,
-		C1_B_Cb, C0_G_Y, C2_R_Cr, 0, 3,
+		C2_R_Cr, C0_G_Y, C1_B_Cb, 0, 3,
 		false, 2, 0,
 		DPU_FETCH_LINEAR, 1),
 
 	INTERLEAVED_RGB_FMT(BGR565,
 		0, COLOR_5BIT, COLOR_6BIT, COLOR_5BIT,
-		C2_R_Cr, C0_G_Y, C1_B_Cb, 0, 3,
+		C1_B_Cb, C0_G_Y, C2_R_Cr, 0, 3,
 		false, 2, 0,
 		DPU_FETCH_LINEAR, 1),
 
@@ -1040,10 +1032,11 @@ int dpu_format_check_modified_format(
 		const struct drm_mode_fb_cmd2 *cmd,
 		struct drm_gem_object **bos)
 {
-	int ret, i, num_base_fmt_planes;
+	const struct drm_format_info *info;
 	const struct dpu_format *fmt;
 	struct dpu_hw_fmt_layout layout;
 	uint32_t bos_total_size = 0;
+	int ret, i;
 
 	if (!msm_fmt || !cmd || !bos) {
 		DRM_ERROR("invalid arguments\n");
@@ -1051,14 +1044,16 @@ int dpu_format_check_modified_format(
 	}
 
 	fmt = to_dpu_format(msm_fmt);
-	num_base_fmt_planes = drm_format_num_planes(fmt->base.pixel_format);
+	info = drm_format_info(fmt->base.pixel_format);
+	if (!info)
+		return -EINVAL;
 
 	ret = dpu_format_get_plane_sizes(fmt, cmd->width, cmd->height,
 			&layout, cmd->pitches);
 	if (ret)
 		return ret;
 
-	for (i = 0; i < num_base_fmt_planes; i++) {
+	for (i = 0; i < info->num_planes; i++) {
 		if (!bos[i]) {
 			DRM_ERROR("invalid handle for plane %d\n", i);
 			return -EINVAL;
@@ -1136,37 +1131,4 @@ const struct msm_format *dpu_get_msm_format(
 	if (fmt)
 		return &fmt->base;
 	return NULL;
-}
-
-uint32_t dpu_populate_formats(
-		const struct dpu_format_extended *format_list,
-		uint32_t *pixel_formats,
-		uint64_t *pixel_modifiers,
-		uint32_t pixel_formats_max)
-{
-	uint32_t i, fourcc_format;
-
-	if (!format_list || !pixel_formats)
-		return 0;
-
-	for (i = 0, fourcc_format = 0;
-			format_list->fourcc_format && i < pixel_formats_max;
-			++format_list) {
-		/* verify if listed format is in dpu_format_map? */
-
-		/* optionally return modified formats */
-		if (pixel_modifiers) {
-			/* assume same modifier for all fb planes */
-			pixel_formats[i] = format_list->fourcc_format;
-			pixel_modifiers[i++] = format_list->modifier;
-		} else {
-			/* assume base formats grouped together */
-			if (fourcc_format != format_list->fourcc_format) {
-				fourcc_format = format_list->fourcc_format;
-				pixel_formats[i++] = fourcc_format;
-			}
-		}
-	}
-
-	return i;
 }

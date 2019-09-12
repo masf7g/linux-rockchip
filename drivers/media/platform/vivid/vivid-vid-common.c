@@ -169,6 +169,36 @@ struct vivid_fmt vivid_formats[] = {
 		.alpha_mask = 0x000000ff,
 	},
 	{
+		.fourcc   = V4L2_PIX_FMT_AYUV32,
+		.vdownsampling = { 1 },
+		.bit_depth = { 32 },
+		.planes   = 1,
+		.buffers = 1,
+		.alpha_mask = 0x000000ff,
+	},
+	{
+		.fourcc   = V4L2_PIX_FMT_XYUV32,
+		.vdownsampling = { 1 },
+		.bit_depth = { 32 },
+		.planes   = 1,
+		.buffers = 1,
+	},
+	{
+		.fourcc   = V4L2_PIX_FMT_VUYA32,
+		.vdownsampling = { 1 },
+		.bit_depth = { 32 },
+		.planes   = 1,
+		.buffers = 1,
+		.alpha_mask = 0xff000000,
+	},
+	{
+		.fourcc   = V4L2_PIX_FMT_VUYX32,
+		.vdownsampling = { 1 },
+		.bit_depth = { 32 },
+		.planes   = 1,
+		.buffers = 1,
+	},
+	{
 		.fourcc   = V4L2_PIX_FMT_GREY,
 		.vdownsampling = { 1 },
 		.bit_depth = { 8 },
@@ -765,26 +795,6 @@ int vivid_enum_fmt_vid(struct file *file, void  *priv,
 
 	f->pixelformat = fmt->fourcc;
 	return 0;
-}
-
-int vidioc_enum_fmt_vid_mplane(struct file *file, void  *priv,
-					struct v4l2_fmtdesc *f)
-{
-	struct vivid_dev *dev = video_drvdata(file);
-
-	if (!dev->multiplanar)
-		return -ENOTTY;
-	return vivid_enum_fmt_vid(file, priv, f);
-}
-
-int vidioc_enum_fmt_vid(struct file *file, void  *priv,
-					struct v4l2_fmtdesc *f)
-{
-	struct vivid_dev *dev = video_drvdata(file);
-
-	if (dev->multiplanar)
-		return -ENOTTY;
-	return vivid_enum_fmt_vid(file, priv, f);
 }
 
 int vidioc_g_std(struct file *file, void *priv, v4l2_std_id *id)

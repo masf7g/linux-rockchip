@@ -22,8 +22,9 @@
  * Authors: Christian König <christian.koenig@amd.com>
  */
 
+#include <linux/delay.h>
 #include <linux/firmware.h>
-#include <drm/drmP.h>
+
 #include "amdgpu.h"
 #include "amdgpu_uvd.h"
 #include "vid.h"
@@ -506,7 +507,7 @@ static int uvd_v5_0_ring_test_ring(struct amdgpu_ring *ring)
 		tmp = RREG32(mmUVD_CONTEXT_ID);
 		if (tmp == 0xDEADBEEF)
 			break;
-		DRM_UDELAY(1);
+		udelay(1);
 	}
 
 	if (i >= adev->usec_timeout)
@@ -526,7 +527,7 @@ static int uvd_v5_0_ring_test_ring(struct amdgpu_ring *ring)
 static void uvd_v5_0_ring_emit_ib(struct amdgpu_ring *ring,
 				  struct amdgpu_job *job,
 				  struct amdgpu_ib *ib,
-				  bool ctx_switch)
+				  uint32_t flags)
 {
 	amdgpu_ring_write(ring, PACKET0(mmUVD_LMI_RBC_IB_64BIT_BAR_LOW, 0));
 	amdgpu_ring_write(ring, lower_32_bits(ib->gpu_addr));

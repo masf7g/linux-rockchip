@@ -27,16 +27,19 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  */
-#include <linux/kernel.h>
-#include <linux/slab.h>
+
 #include <linux/hdmi.h>
 #include <linux/i2c.h>
+#include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <linux/vga_switcheroo.h>
-#include <drm/drmP.h>
+
+#include <drm/drm_displayid.h>
+#include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_encoder.h>
-#include <drm/drm_displayid.h>
+#include <drm/drm_print.h>
 #include <drm/drm_scdc_helper.h>
 
 #include "drm_crtc_internal.h"
@@ -68,8 +71,6 @@
  * maximum size and use that.
  */
 #define EDID_QUIRK_DETAILED_USE_MAXIMUM_SIZE	(1 << 4)
-/* Monitor forgot to set the first detailed is preferred bit. */
-#define EDID_QUIRK_FIRST_DETAILED_PREFERRED	(1 << 5)
 /* use +hsync +vsync for detailed mode */
 #define EDID_QUIRK_DETAILED_SYNC_PP		(1 << 6)
 /* Force reduced-blanking timings for detailed modes */
@@ -107,8 +108,6 @@ static const struct edid_quirk {
 	{ "ACR", 44358, EDID_QUIRK_PREFER_LARGE_60 },
 	/* Acer F51 */
 	{ "API", 0x7602, EDID_QUIRK_PREFER_LARGE_60 },
-	/* Unknown Acer */
-	{ "ACR", 2423, EDID_QUIRK_FIRST_DETAILED_PREFERRED },
 
 	/* AEO model 0 reports 8 bpc, but is a 6 bpc panel */
 	{ "AEO", 0, EDID_QUIRK_FORCE_6BPC },
@@ -145,12 +144,6 @@ static const struct edid_quirk {
 	{ "LPL", 0, EDID_QUIRK_DETAILED_USE_MAXIMUM_SIZE },
 	{ "LPL", 0x2a00, EDID_QUIRK_DETAILED_USE_MAXIMUM_SIZE },
 
-	/* Philips 107p5 CRT */
-	{ "PHL", 57364, EDID_QUIRK_FIRST_DETAILED_PREFERRED },
-
-	/* Proview AY765C */
-	{ "PTS", 765, EDID_QUIRK_FIRST_DETAILED_PREFERRED },
-
 	/* Samsung SyncMaster 205BW.  Note: irony */
 	{ "SAM", 541, EDID_QUIRK_DETAILED_SYNC_PP },
 	/* Samsung SyncMaster 22[5-6]BW */
@@ -171,6 +164,25 @@ static const struct edid_quirk {
 
 	/* Rotel RSX-1058 forwards sink's EDID but only does HDMI 1.1*/
 	{ "ETR", 13896, EDID_QUIRK_FORCE_8BPC },
+
+	/* Valve Index Headset */
+	{ "VLV", 0x91a8, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91b0, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91b1, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91b2, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91b3, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91b4, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91b5, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91b6, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91b7, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91b8, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91b9, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91ba, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91bb, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91bc, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91bd, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91be, EDID_QUIRK_NON_DESKTOP },
+	{ "VLV", 0x91bf, EDID_QUIRK_NON_DESKTOP },
 
 	/* HTC Vive and Vive Pro VR Headsets */
 	{ "HVR", 0xaa01, EDID_QUIRK_NON_DESKTOP },
@@ -193,6 +205,12 @@ static const struct edid_quirk {
 
 	/* Sony PlayStation VR Headset */
 	{ "SNY", 0x0704, EDID_QUIRK_NON_DESKTOP },
+
+	/* Sensics VR Headsets */
+	{ "SEN", 0x1019, EDID_QUIRK_NON_DESKTOP },
+
+	/* OSVR HDK and HDK2 VR Headsets */
+	{ "SVR", 0x1019, EDID_QUIRK_NON_DESKTOP },
 };
 
 /*
@@ -1555,6 +1573,50 @@ static void connector_bad_edid(struct drm_connector *connector,
 	}
 }
 
+/* Get override or firmware EDID */
+static struct edid *drm_get_override_edid(struct drm_connector *connector)
+{
+	struct edid *override = NULL;
+
+	if (connector->override_edid)
+		override = drm_edid_duplicate(connector->edid_blob_ptr->data);
+
+	if (!override)
+		override = drm_load_edid_firmware(connector);
+
+	return IS_ERR(override) ? NULL : override;
+}
+
+/**
+ * drm_add_override_edid_modes - add modes from override/firmware EDID
+ * @connector: connector we're probing
+ *
+ * Add modes from the override/firmware EDID, if available. Only to be used from
+ * drm_helper_probe_single_connector_modes() as a fallback for when DDC probe
+ * failed during drm_get_edid() and caused the override/firmware EDID to be
+ * skipped.
+ *
+ * Return: The number of modes added or 0 if we couldn't find any.
+ */
+int drm_add_override_edid_modes(struct drm_connector *connector)
+{
+	struct edid *override;
+	int num_modes = 0;
+
+	override = drm_get_override_edid(connector);
+	if (override) {
+		drm_connector_update_edid_property(connector, override);
+		num_modes = drm_add_edid_modes(connector, override);
+		kfree(override);
+
+		DRM_DEBUG_KMS("[CONNECTOR:%d:%s] adding %d modes via fallback override/firmware EDID\n",
+			      connector->base.id, connector->name, num_modes);
+	}
+
+	return num_modes;
+}
+EXPORT_SYMBOL(drm_add_override_edid_modes);
+
 /**
  * drm_do_get_edid - get EDID data using a custom EDID block read function
  * @connector: connector we're probing
@@ -1582,15 +1644,10 @@ struct edid *drm_do_get_edid(struct drm_connector *connector,
 {
 	int i, j = 0, valid_extensions = 0;
 	u8 *edid, *new;
-	struct edid *override = NULL;
+	struct edid *override;
 
-	if (connector->override_edid)
-		override = drm_edid_duplicate(connector->edid_blob_ptr->data);
-
-	if (!override)
-		override = drm_load_edid_firmware(connector);
-
-	if (!IS_ERR_OR_NULL(override))
+	override = drm_get_override_edid(connector);
+	if (override)
 		return override;
 
 	if ((edid = kmalloc(EDID_LENGTH, GFP_KERNEL)) == NULL)
@@ -2834,6 +2891,7 @@ add_detailed_modes(struct drm_connector *connector, struct edid *edid,
 #define VIDEO_BLOCK     0x02
 #define VENDOR_BLOCK    0x03
 #define SPEAKER_BLOCK	0x04
+#define HDR_STATIC_METADATA_BLOCK	0x6
 #define USE_EXTENDED_TAG 0x07
 #define EXT_VIDEO_CAPABILITY_BLOCK 0x00
 #define EXT_VIDEO_DATA_BLOCK_420	0x0E
@@ -3816,6 +3874,55 @@ static void fixup_detailed_cea_mode_clock(struct drm_display_mode *mode)
 	mode->clock = clock;
 }
 
+static bool cea_db_is_hdmi_hdr_metadata_block(const u8 *db)
+{
+	if (cea_db_tag(db) != USE_EXTENDED_TAG)
+		return false;
+
+	if (db[1] != HDR_STATIC_METADATA_BLOCK)
+		return false;
+
+	if (cea_db_payload_len(db) < 3)
+		return false;
+
+	return true;
+}
+
+static uint8_t eotf_supported(const u8 *edid_ext)
+{
+	return edid_ext[2] &
+		(BIT(HDMI_EOTF_TRADITIONAL_GAMMA_SDR) |
+		 BIT(HDMI_EOTF_TRADITIONAL_GAMMA_HDR) |
+		 BIT(HDMI_EOTF_SMPTE_ST2084) |
+		 BIT(HDMI_EOTF_BT_2100_HLG));
+}
+
+static uint8_t hdr_metadata_type(const u8 *edid_ext)
+{
+	return edid_ext[3] &
+		BIT(HDMI_STATIC_METADATA_TYPE1);
+}
+
+static void
+drm_parse_hdr_metadata_block(struct drm_connector *connector, const u8 *db)
+{
+	u16 len;
+
+	len = cea_db_payload_len(db);
+
+	connector->hdr_sink_metadata.hdmi_type1.eotf =
+						eotf_supported(db);
+	connector->hdr_sink_metadata.hdmi_type1.metadata_type =
+						hdr_metadata_type(db);
+
+	if (len >= 4)
+		connector->hdr_sink_metadata.hdmi_type1.max_cll = db[4];
+	if (len >= 5)
+		connector->hdr_sink_metadata.hdmi_type1.max_fall = db[5];
+	if (len >= 6)
+		connector->hdr_sink_metadata.hdmi_type1.min_cll = db[6];
+}
+
 static void
 drm_parse_hdmi_vsdb_audio(struct drm_connector *connector, const u8 *db)
 {
@@ -4443,6 +4550,8 @@ static void drm_parse_cea_ext(struct drm_connector *connector,
 			drm_parse_y420cmdb_bitmap(connector, db);
 		if (cea_db_is_vcdb(db))
 			drm_parse_vcdb(connector, db);
+		if (cea_db_is_hdmi_hdr_metadata_block(db))
+			drm_parse_hdr_metadata_block(connector, db);
 	}
 }
 
@@ -4499,8 +4608,8 @@ u32 drm_add_display_info(struct drm_connector *connector, const struct edid *edi
 	 * tells us to assume 8 bpc color depth if the EDID doesn't have
 	 * extensions which tell otherwise.
 	 */
-	if ((info->bpc == 0) && (edid->revision < 4) &&
-	    (edid->input & DRM_EDID_DIGITAL_TYPE_DVI)) {
+	if (info->bpc == 0 && edid->revision == 3 &&
+	    edid->input & DRM_EDID_DIGITAL_DFP_1_X) {
 		info->bpc = 8;
 		DRM_DEBUG("%s: Assigning DFP sink color depth as %d bpc.\n",
 			  connector->name, info->bpc);
@@ -4835,6 +4944,78 @@ static bool is_hdmi2_sink(struct drm_connector *connector)
 		connector->display_info.color_formats & DRM_COLOR_FORMAT_YCRCB420;
 }
 
+static inline bool is_eotf_supported(u8 output_eotf, u8 sink_eotf)
+{
+	return sink_eotf & BIT(output_eotf);
+}
+
+/**
+ * drm_hdmi_infoframe_set_hdr_metadata() - fill an HDMI DRM infoframe with
+ *                                         HDR metadata from userspace
+ * @frame: HDMI DRM infoframe
+ * @conn_state: Connector state containing HDR metadata
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int
+drm_hdmi_infoframe_set_hdr_metadata(struct hdmi_drm_infoframe *frame,
+				    const struct drm_connector_state *conn_state)
+{
+	struct drm_connector *connector;
+	struct hdr_output_metadata *hdr_metadata;
+	int err;
+
+	if (!frame || !conn_state)
+		return -EINVAL;
+
+	connector = conn_state->connector;
+
+	if (!conn_state->hdr_output_metadata)
+		return -EINVAL;
+
+	hdr_metadata = conn_state->hdr_output_metadata->data;
+
+	if (!hdr_metadata || !connector)
+		return -EINVAL;
+
+	/* Sink EOTF is Bit map while infoframe is absolute values */
+	if (!is_eotf_supported(hdr_metadata->hdmi_metadata_type1.eotf,
+	    connector->hdr_sink_metadata.hdmi_type1.eotf)) {
+		DRM_DEBUG_KMS("EOTF Not Supported\n");
+		return -EINVAL;
+	}
+
+	err = hdmi_drm_infoframe_init(frame);
+	if (err < 0)
+		return err;
+
+	frame->eotf = hdr_metadata->hdmi_metadata_type1.eotf;
+	frame->metadata_type = hdr_metadata->hdmi_metadata_type1.metadata_type;
+
+	BUILD_BUG_ON(sizeof(frame->display_primaries) !=
+		     sizeof(hdr_metadata->hdmi_metadata_type1.display_primaries));
+	BUILD_BUG_ON(sizeof(frame->white_point) !=
+		     sizeof(hdr_metadata->hdmi_metadata_type1.white_point));
+
+	memcpy(&frame->display_primaries,
+	       &hdr_metadata->hdmi_metadata_type1.display_primaries,
+	       sizeof(frame->display_primaries));
+
+	memcpy(&frame->white_point,
+	       &hdr_metadata->hdmi_metadata_type1.white_point,
+	       sizeof(frame->white_point));
+
+	frame->max_display_mastering_luminance =
+		hdr_metadata->hdmi_metadata_type1.max_display_mastering_luminance;
+	frame->min_display_mastering_luminance =
+		hdr_metadata->hdmi_metadata_type1.min_display_mastering_luminance;
+	frame->max_fall = hdr_metadata->hdmi_metadata_type1.max_fall;
+	frame->max_cll = hdr_metadata->hdmi_metadata_type1.max_cll;
+
+	return 0;
+}
+EXPORT_SYMBOL(drm_hdmi_infoframe_set_hdr_metadata);
+
 /**
  * drm_hdmi_avi_infoframe_from_display_mode() - fill an HDMI AVI infoframe with
  *                                              data from a DRM display mode
@@ -4923,6 +5104,76 @@ drm_hdmi_avi_infoframe_from_display_mode(struct hdmi_avi_infoframe *frame,
 	return 0;
 }
 EXPORT_SYMBOL(drm_hdmi_avi_infoframe_from_display_mode);
+
+/* HDMI Colorspace Spec Definitions */
+#define FULL_COLORIMETRY_MASK		0x1FF
+#define NORMAL_COLORIMETRY_MASK		0x3
+#define EXTENDED_COLORIMETRY_MASK	0x7
+#define EXTENDED_ACE_COLORIMETRY_MASK	0xF
+
+#define C(x) ((x) << 0)
+#define EC(x) ((x) << 2)
+#define ACE(x) ((x) << 5)
+
+#define HDMI_COLORIMETRY_NO_DATA		0x0
+#define HDMI_COLORIMETRY_SMPTE_170M_YCC		(C(1) | EC(0) | ACE(0))
+#define HDMI_COLORIMETRY_BT709_YCC		(C(2) | EC(0) | ACE(0))
+#define HDMI_COLORIMETRY_XVYCC_601		(C(3) | EC(0) | ACE(0))
+#define HDMI_COLORIMETRY_XVYCC_709		(C(3) | EC(1) | ACE(0))
+#define HDMI_COLORIMETRY_SYCC_601		(C(3) | EC(2) | ACE(0))
+#define HDMI_COLORIMETRY_OPYCC_601		(C(3) | EC(3) | ACE(0))
+#define HDMI_COLORIMETRY_OPRGB			(C(3) | EC(4) | ACE(0))
+#define HDMI_COLORIMETRY_BT2020_CYCC		(C(3) | EC(5) | ACE(0))
+#define HDMI_COLORIMETRY_BT2020_RGB		(C(3) | EC(6) | ACE(0))
+#define HDMI_COLORIMETRY_BT2020_YCC		(C(3) | EC(6) | ACE(0))
+#define HDMI_COLORIMETRY_DCI_P3_RGB_D65		(C(3) | EC(7) | ACE(0))
+#define HDMI_COLORIMETRY_DCI_P3_RGB_THEATER	(C(3) | EC(7) | ACE(1))
+
+static const u32 hdmi_colorimetry_val[] = {
+	[DRM_MODE_COLORIMETRY_NO_DATA] = HDMI_COLORIMETRY_NO_DATA,
+	[DRM_MODE_COLORIMETRY_SMPTE_170M_YCC] = HDMI_COLORIMETRY_SMPTE_170M_YCC,
+	[DRM_MODE_COLORIMETRY_BT709_YCC] = HDMI_COLORIMETRY_BT709_YCC,
+	[DRM_MODE_COLORIMETRY_XVYCC_601] = HDMI_COLORIMETRY_XVYCC_601,
+	[DRM_MODE_COLORIMETRY_XVYCC_709] = HDMI_COLORIMETRY_XVYCC_709,
+	[DRM_MODE_COLORIMETRY_SYCC_601] = HDMI_COLORIMETRY_SYCC_601,
+	[DRM_MODE_COLORIMETRY_OPYCC_601] = HDMI_COLORIMETRY_OPYCC_601,
+	[DRM_MODE_COLORIMETRY_OPRGB] = HDMI_COLORIMETRY_OPRGB,
+	[DRM_MODE_COLORIMETRY_BT2020_CYCC] = HDMI_COLORIMETRY_BT2020_CYCC,
+	[DRM_MODE_COLORIMETRY_BT2020_RGB] = HDMI_COLORIMETRY_BT2020_RGB,
+	[DRM_MODE_COLORIMETRY_BT2020_YCC] = HDMI_COLORIMETRY_BT2020_YCC,
+};
+
+#undef C
+#undef EC
+#undef ACE
+
+/**
+ * drm_hdmi_avi_infoframe_colorspace() - fill the HDMI AVI infoframe
+ *                                       colorspace information
+ * @frame: HDMI AVI infoframe
+ * @conn_state: connector state
+ */
+void
+drm_hdmi_avi_infoframe_colorspace(struct hdmi_avi_infoframe *frame,
+				  const struct drm_connector_state *conn_state)
+{
+	u32 colorimetry_val;
+	u32 colorimetry_index = conn_state->colorspace & FULL_COLORIMETRY_MASK;
+
+	if (colorimetry_index >= ARRAY_SIZE(hdmi_colorimetry_val))
+		colorimetry_val = HDMI_COLORIMETRY_NO_DATA;
+	else
+		colorimetry_val = hdmi_colorimetry_val[colorimetry_index];
+
+	frame->colorimetry = colorimetry_val & NORMAL_COLORIMETRY_MASK;
+	/*
+	 * ToDo: Extend it for ACE formats as well. Modify the infoframe
+	 * structure and extend it in drivers/video/hdmi
+	 */
+	frame->extended_colorimetry = (colorimetry_val >> 2) &
+					EXTENDED_COLORIMETRY_MASK;
+}
+EXPORT_SYMBOL(drm_hdmi_avi_infoframe_colorspace);
 
 /**
  * drm_hdmi_avi_infoframe_quant_range() - fill the HDMI AVI infoframe

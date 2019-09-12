@@ -10,25 +10,6 @@ graphics subsystem useful as newbie projects. Or for slow rainy days.
 Subsystem-wide refactorings
 ===========================
 
-De-midlayer drivers
--------------------
-
-With the recent ``drm_bus`` cleanup patches for 3.17 it is no longer required
-to have a ``drm_bus`` structure set up. Drivers can directly set up the
-``drm_device`` structure instead of relying on bus methods in ``drm_usb.c``
-and ``drm_pci.c``. The goal is to get rid of the driver's ``->load`` /
-``->unload`` callbacks and open-code the load/unload sequence properly, using
-the new two-stage ``drm_device`` setup/teardown.
-
-Once all existing drivers are converted we can also remove those bus support
-files for USB and platform devices.
-
-All you need is a GPU for a non-converted driver (currently almost all of
-them, but also all the virtual ones used by KVM, so everyone qualifies).
-
-Contact: Daniel Vetter, Thierry Reding, respective driver maintainers
-
-
 Remove custom dumb_map_offset implementations
 ---------------------------------------------
 
@@ -215,12 +196,12 @@ Might be good to also have some igt testcases for this.
 
 Contact: Daniel Vetter, Noralf Tronnes
 
-Put a reservation_object into drm_gem_object
+Remove the ->gem_prime_res_obj callback
 --------------------------------------------
 
-This would remove the need for the ->gem_prime_res_obj callback. It would also
-allow us to implement generic helpers for waiting for a bo, allowing for quite a
-bit of refactoring in the various wait ioctl implementations.
+The ->gem_prime_res_obj callback can be removed from drivers by using the
+reservation_object in the drm_gem_object. It may also be possible to use the
+generic drm_gem_reservation_object_wait helper for waiting for a bo.
 
 Contact: Daniel Vetter
 
@@ -261,6 +242,59 @@ used.
 As a reference, take a look at the conversions already completed in drm core.
 
 Contact: Sean Paul, respective driver maintainers
+
+Rename CMA helpers to DMA helpers
+---------------------------------
+
+CMA (standing for contiguous memory allocator) is really a bit an accident of
+what these were used for first, a much better name would be DMA helpers. In the
+text these should even be called coherent DMA memory helpers (so maybe CDM, but
+no one knows what that means) since underneath they just use dma_alloc_coherent.
+
+Contact: Laurent Pinchart, Daniel Vetter
+
+Convert direct mode.vrefresh accesses to use drm_mode_vrefresh()
+----------------------------------------------------------------
+
+drm_display_mode.vrefresh isn't guaranteed to be populated. As such, using it
+is risky and has been known to cause div-by-zero bugs. Fortunately, drm core
+has helper which will use mode.vrefresh if it's !0 and will calculate it from
+the timings when it's 0.
+
+Use simple search/replace, or (more fun) cocci to replace instances of direct
+vrefresh access with a call to the helper. Check out
+https://lists.freedesktop.org/archives/dri-devel/2019-January/205186.html for
+inspiration.
+
+Once all instances of vrefresh have been converted, remove vrefresh from
+drm_display_mode to avoid future use.
+
+Contact: Sean Paul
+
+Remove drm_display_mode.hsync
+-----------------------------
+
+We have drm_mode_hsync() to calculate this from hsync_start/end, since drivers
+shouldn't/don't use this, remove this member to avoid any temptations to use it
+in the future. If there is any debug code using drm_display_mode.hsync, convert
+it to use drm_mode_hsync() instead.
+
+Contact: Sean Paul
+
+drm_fb_helper tasks
+-------------------
+
+- drm_fb_helper_restore_fbdev_mode_unlocked() should call restore_fbdev_mode()
+  not the _force variant so it can bail out if there is a master. But first
+  these igt tests need to be fixed: kms_fbcon_fbt@psr and
+  kms_fbcon_fbt@psr-suspend.
+
+- The max connector argument for drm_fb_helper_init() and
+  drm_fb_helper_fbdev_setup() isn't used anymore and can be removed.
+
+- The helper doesn't keep an array of connectors anymore so these can be
+  removed: drm_fb_helper_single_add_all_connectors(),
+  drm_fb_helper_add_one_connector() and drm_fb_helper_remove_one_connector().
 
 Core refactorings
 =================
@@ -360,10 +394,6 @@ KMS cleanups
 
 Some of these date from the very introduction of KMS in 2008 ...
 
-- drm_display_mode doesn't need to be derived from drm_mode_object. That's
-  leftovers from older (never merged into upstream) KMS designs where modes
-  where set using their ID, including support to add/remove modes.
-
 - Make ->funcs and ->helper_private vtables optional. There's a bunch of empty
   function tables in drivers, but before we can remove them we need to make sure
   that all the users in helpers and drivers do correctly check for a NULL
@@ -435,10 +465,6 @@ those drivers as simple as possible, so lots of room for refactoring:
   one of the ideas for having a shared dsi/dbi helper, abstracting away the
   transport details more.
 
-- Quick aside: The unregister devm stuff is kinda getting the lifetimes of
-  a drm_device wrong. Doesn't matter, since everyone else gets it wrong
-  too :-)
-
 Contact: Noralf Trønnes, Daniel Vetter
 
 AMD DC Display Driver
@@ -457,6 +483,21 @@ i915
 - Our early/late pm callbacks could be removed in favour of using
   device_link_add to model the dependency between i915 and snd_had. See
   https://dri.freedesktop.org/docs/drm/driver-api/device_link.html
+
+Bootsplash
+==========
+
+There is support in place now for writing internal DRM clients making it
+possible to pick up the bootsplash work that was rejected because it was written
+for fbdev.
+
+- [v6,8/8] drm/client: Hack: Add bootsplash example
+  https://patchwork.freedesktop.org/patch/306579/
+
+- [RFC PATCH v2 00/13] Kernel based bootsplash
+  https://lkml.org/lkml/2017/12/13/764
+
+Contact: Sam Ravnborg
 
 Outside DRM
 ===========

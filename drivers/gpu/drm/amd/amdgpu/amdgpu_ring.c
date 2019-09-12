@@ -28,8 +28,9 @@
  */
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/uaccess.h>
 #include <linux/debugfs.h>
-#include <drm/drmP.h>
+
 #include <drm/amdgpu_drm.h>
 #include "amdgpu.h"
 #include "atom.h"
@@ -248,6 +249,8 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
 	 */
 	if (ring->funcs->type == AMDGPU_RING_TYPE_KIQ)
 		sched_hw_submission = max(sched_hw_submission, 256);
+	else if (ring == &adev->sdma.instance[0].page)
+		sched_hw_submission = 256;
 
 	if (ring->adev == NULL) {
 		if (adev->num_rings >= AMDGPU_MAX_RINGS)

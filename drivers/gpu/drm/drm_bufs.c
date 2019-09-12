@@ -28,15 +28,26 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include <linux/vmalloc.h>
-#include <linux/slab.h>
-#include <linux/log2.h>
 #include <linux/export.h>
+#include <linux/log2.h>
+#include <linux/mm.h>
+#include <linux/mman.h>
+#include <linux/nospec.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/vmalloc.h>
+
 #include <asm/shmparam.h>
-#include <drm/drmP.h>
+
+#include <drm/drm_agpsupport.h>
+#include <drm/drm_device.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_file.h>
+#include <drm/drm_pci.h>
+#include <drm/drm_print.h>
+
 #include "drm_legacy.h"
 
-#include <linux/nospec.h>
 
 static struct drm_map_list *drm_find_matching_map(struct drm_device *dev,
 						  struct drm_local_map *map)
@@ -494,7 +505,7 @@ int drm_legacy_getmap_ioctl(struct drm_device *dev, void *data,
  * isn't in use.
  *
  * Searches the map on drm_device::maplist, removes it from the list, see if
- * its being used, and free any associate resource (such as MTRR's) if it's not
+ * it's being used, and free any associated resource (such as MTRR's) if it's not
  * being on use.
  *
  * \sa drm_legacy_addmap
@@ -584,6 +595,14 @@ void drm_legacy_master_rmmaps(struct drm_device *dev, struct drm_master *master)
 	mutex_unlock(&dev->struct_mutex);
 }
 
+void drm_legacy_rmmaps(struct drm_device *dev)
+{
+	struct drm_map_list *r_list, *list_temp;
+
+	list_for_each_entry_safe(r_list, list_temp, &dev->maplist, head)
+		drm_legacy_rmmap(dev, r_list->map);
+}
+
 /* The rmmap ioctl appears to be unnecessary.  All mappings are torn down on
  * the last close of the device, and this is necessary for cleanup when things
  * exit uncleanly.  Therefore, having userland manually remove mappings seems
@@ -621,7 +640,7 @@ int drm_legacy_rmmap_ioctl(struct drm_device *dev, void *data,
 		}
 	}
 
-	/* List has wrapped around to the head pointer, or its empty we didn't
+	/* List has wrapped around to the head pointer, or it's empty we didn't
 	 * find anything.
 	 */
 	if (list_empty(&dev->maplist) || !map) {

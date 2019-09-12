@@ -361,7 +361,7 @@ struct drm_mode_config {
 	 *
 	 * This is the big scary modeset BKL which protects everything that
 	 * isn't protect otherwise. Scope is unclear and fuzzy, try to remove
-	 * anything from under it's protection and move it into more well-scoped
+	 * anything from under its protection and move it into more well-scoped
 	 * locks.
 	 *
 	 * The one important thing this protects is the use of @acquire_ctx.
@@ -835,6 +835,19 @@ struct drm_mode_config {
 	 * See also: drm_writeback_connector_init()
 	 */
 	struct drm_property *writeback_out_fence_ptr_property;
+
+	/**
+	 * @hdr_output_metadata_property: Connector property containing hdr
+	 * metatada. This will be provided by userspace compositors based
+	 * on HDR content
+	 */
+	struct drm_property *hdr_output_metadata_property;
+
+	/**
+	 * @content_protection_property: DRM ENUM property for content
+	 * protection. See drm_connector_attach_content_protection_property().
+	 */
+	struct drm_property *content_protection_property;
 
 	/* dumb ioctl parameters */
 	uint32_t preferred_depth, prefer_shadow;

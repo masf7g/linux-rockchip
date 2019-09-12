@@ -1,14 +1,10 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * linux/drivers/media/platform/coda/coda_regs.h
  *
  * Copyright (C) 2012 Vista Silicon SL
  *    Javier Martin <javier.martin@vista-silicon.com>
  *    Xavier Duret
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
  */
 
 #ifndef _REGS_CODA_H_
@@ -181,7 +177,7 @@
 #define CODA_RET_DEC_SEQ_FRATE_DR		0x1e8
 #define CODA_RET_DEC_SEQ_JPG_PARA		0x1e4
 #define CODA_RET_DEC_SEQ_JPG_THUMB_IND		0x1e8
-#define CODA9_RET_DEC_SEQ_HEADER_REPORT		0x1ec
+#define CODA7_RET_DEC_SEQ_HEADER_REPORT		0x1ec
 
 /* Decoder Picture Run */
 #define CODA_CMD_DEC_PIC_ROT_MODE		0x180

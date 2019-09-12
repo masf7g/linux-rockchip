@@ -22,15 +22,11 @@
  *
  */
 
-#include <drm/drmP.h>
 #include <drm/i915_drm.h>
 #include "i915_drv.h"
 
 #define QUIET (__GFP_NORETRY | __GFP_NOWARN)
 #define MAYFAIL (__GFP_RETRY_MAYFAIL | __GFP_NOWARN)
-
-/* convert swiotlb segment size into sensible units (pages)! */
-#define IO_TLB_SEGPAGES (IO_TLB_SEGSIZE << IO_TLB_SHIFT >> PAGE_SHIFT)
 
 static void internal_free_pages(struct sg_table *st)
 {
@@ -194,7 +190,7 @@ i915_gem_object_create_internal(struct drm_i915_private *i915,
 	if (overflows_type(size, obj->base.size))
 		return ERR_PTR(-E2BIG);
 
-	obj = i915_gem_object_alloc(i915);
+	obj = i915_gem_object_alloc();
 	if (!obj)
 		return ERR_PTR(-ENOMEM);
 

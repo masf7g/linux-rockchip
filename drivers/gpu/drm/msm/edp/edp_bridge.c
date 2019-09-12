@@ -1,14 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2014-2015, The Linux Foundation. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #include "edp.h"
@@ -52,8 +44,8 @@ static void edp_bridge_post_disable(struct drm_bridge *bridge)
 }
 
 static void edp_bridge_mode_set(struct drm_bridge *bridge,
-		struct drm_display_mode *mode,
-		struct drm_display_mode *adjusted_mode)
+		const struct drm_display_mode *mode,
+		const struct drm_display_mode *adjusted_mode)
 {
 	struct drm_device *dev = bridge->dev;
 	struct drm_connector *connector;

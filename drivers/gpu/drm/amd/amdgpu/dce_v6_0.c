@@ -20,7 +20,12 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  *
  */
-#include <drm/drmP.h>
+
+#include <linux/pci.h>
+
+#include <drm/drm_fourcc.h>
+#include <drm/drm_vblank.h>
+
 #include "amdgpu.h"
 #include "amdgpu_pm.h"
 #include "amdgpu_i2c.h"
@@ -2980,7 +2985,7 @@ static int dce_v6_0_pageflip_irq(struct amdgpu_device *adev,
 				 struct amdgpu_irq_src *source,
 				 struct amdgpu_iv_entry *entry)
 {
-		unsigned long flags;
+	unsigned long flags;
 	unsigned crtc_id;
 	struct amdgpu_crtc *amdgpu_crtc;
 	struct amdgpu_flip_work *works;

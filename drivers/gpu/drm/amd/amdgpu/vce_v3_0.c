@@ -26,7 +26,7 @@
  */
 
 #include <linux/firmware.h>
-#include <drm/drmP.h>
+
 #include "amdgpu.h"
 #include "amdgpu_vce.h"
 #include "vid.h"
@@ -834,7 +834,7 @@ out:
 static void vce_v3_0_ring_emit_ib(struct amdgpu_ring *ring,
 				  struct amdgpu_job *job,
 				  struct amdgpu_ib *ib,
-				  bool ctx_switch)
+				  uint32_t flags)
 {
 	unsigned vmid = AMDGPU_JOB_GET_VMID(job);
 

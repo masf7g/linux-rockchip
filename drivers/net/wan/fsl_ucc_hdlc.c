@@ -1,11 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /* Freescale QUICC Engine HDLC Device Driver
  *
  * Copyright 2016 Freescale Semiconductor Inc.
- *
- * This program is free software; you can redistribute  it and/or modify it
- * under  the terms of  the GNU General  Public License as published by the
- * Free Software Foundation;  either version 2 of the  License, or (at your
- * option) any later version.
  */
 
 #include <linux/delay.h>
@@ -482,7 +478,7 @@ static int hdlc_tx_done(struct ucc_hdlc_private *priv)
 		memset(priv->tx_buffer +
 		       (be32_to_cpu(bd->buf) - priv->dma_tx_addr),
 		       0, skb->len);
-		dev_kfree_skb_irq(skb);
+		dev_consume_skb_irq(skb);
 
 		priv->tx_skbuff[priv->skb_dirtytx] = NULL;
 		priv->skb_dirtytx =

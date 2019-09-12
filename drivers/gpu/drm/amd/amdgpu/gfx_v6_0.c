@@ -21,6 +21,8 @@
  *
  */
 #include <linux/firmware.h>
+#include <linux/module.h>
+
 #include "amdgpu.h"
 #include "amdgpu_ih.h"
 #include "amdgpu_gfx.h"
@@ -782,6 +784,25 @@ static void gfx_v6_0_tiling_mode_table_init(struct amdgpu_device *adev)
 				BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
 				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_1) |
 				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_2);
+		tilemode[18] =  MICRO_TILE_MODE(ADDR_SURF_THIN_MICRO_TILING) |
+				ARRAY_MODE(ARRAY_1D_TILED_THICK) |
+				PIPE_CONFIG(ADDR_SURF_P4_8x16);
+		tilemode[19] =  MICRO_TILE_MODE(ADDR_SURF_THIN_MICRO_TILING) |
+				ARRAY_MODE(ARRAY_2D_TILED_XTHICK) |
+				PIPE_CONFIG(ADDR_SURF_P4_8x16) |
+				BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_1) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_2) |
+				NUM_BANKS(ADDR_SURF_16_BANK) |
+				TILE_SPLIT(split_equal_to_row_size);
+		tilemode[20] =  MICRO_TILE_MODE(ADDR_SURF_THIN_MICRO_TILING) |
+				ARRAY_MODE(ARRAY_2D_TILED_THICK) |
+				PIPE_CONFIG(ADDR_SURF_P4_8x16) |
+				BANK_WIDTH(ADDR_SURF_BANK_WIDTH_1) |
+				BANK_HEIGHT(ADDR_SURF_BANK_HEIGHT_1) |
+				MACRO_TILE_ASPECT(ADDR_SURF_MACRO_ASPECT_2) |
+				NUM_BANKS(ADDR_SURF_16_BANK) |
+				TILE_SPLIT(split_equal_to_row_size);
 		tilemode[21] =  MICRO_TILE_MODE(ADDR_SURF_THIN_MICRO_TILING) |
 				ARRAY_MODE(ARRAY_2D_TILED_THIN1) |
 				PIPE_CONFIG(ADDR_SURF_P8_32x32_8x16) |
@@ -1793,7 +1814,7 @@ static int gfx_v6_0_ring_test_ring(struct amdgpu_ring *ring)
 		tmp = RREG32(scratch);
 		if (tmp == 0xDEADBEEF)
 			break;
-		DRM_UDELAY(1);
+		udelay(1);
 	}
 
 	if (i >= adev->usec_timeout)
@@ -1842,13 +1863,13 @@ static void gfx_v6_0_ring_emit_fence(struct amdgpu_ring *ring, u64 addr,
 static void gfx_v6_0_ring_emit_ib(struct amdgpu_ring *ring,
 				  struct amdgpu_job *job,
 				  struct amdgpu_ib *ib,
-				  bool ctx_switch)
+				  uint32_t flags)
 {
 	unsigned vmid = AMDGPU_JOB_GET_VMID(job);
 	u32 header, control = 0;
 
 	/* insert SWITCH_BUFFER packet before first IB in the ring frame */
-	if (ctx_switch) {
+	if (flags & AMDGPU_HAVE_CTX_SWITCH) {
 		amdgpu_ring_write(ring, PACKET3(PACKET3_SWITCH_BUFFER, 0));
 		amdgpu_ring_write(ring, 0);
 	}

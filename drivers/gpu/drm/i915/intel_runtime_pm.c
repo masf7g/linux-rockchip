@@ -29,8 +29,19 @@
 #include <linux/pm_runtime.h>
 #include <linux/vgaarb.h>
 
+#include <drm/drm_print.h>
+
 #include "i915_drv.h"
+#include "i915_irq.h"
+#include "intel_cdclk.h"
+#include "intel_combo_phy.h"
+#include "intel_crt.h"
+#include "intel_csr.h"
+#include "intel_dp.h"
+#include "intel_dpio_phy.h"
 #include "intel_drv.h"
+#include "intel_hotplug.h"
+#include "intel_sideband.h"
 
 /**
  * DOC: runtime pm
@@ -49,6 +60,337 @@
  * present for a given platform.
  */
 
+static intel_wakeref_t intel_runtime_pm_get_raw(struct drm_i915_private *i915);
+static void
+__intel_runtime_pm_put(struct drm_i915_private *i915, intel_wakeref_t wref,
+		       bool wakelock);
+
+#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_RUNTIME_PM)
+static void
+intel_runtime_pm_put_raw(struct drm_i915_private *i915, intel_wakeref_t wref);
+#else
+static inline void intel_runtime_pm_put_raw(struct drm_i915_private *i915,
+					    intel_wakeref_t wref)
+{
+	__intel_runtime_pm_put(i915, -1, false);
+}
+#endif
+
+#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_RUNTIME_PM)
+
+#include <linux/sort.h>
+
+#define STACKDEPTH 8
+
+static noinline depot_stack_handle_t __save_depot_stack(void)
+{
+	unsigned long entries[STACKDEPTH];
+	unsigned int n;
+
+	n = stack_trace_save(entries, ARRAY_SIZE(entries), 1);
+	return stack_depot_save(entries, n, GFP_NOWAIT | __GFP_NOWARN);
+}
+
+static void __print_depot_stack(depot_stack_handle_t stack,
+				char *buf, int sz, int indent)
+{
+	unsigned long *entries;
+	unsigned int nr_entries;
+
+	nr_entries = stack_depot_fetch(stack, &entries);
+	stack_trace_snprint(buf, sz, entries, nr_entries, indent);
+}
+
+static void init_intel_runtime_pm_wakeref(struct drm_i915_private *i915)
+{
+	struct i915_runtime_pm *rpm = &i915->runtime_pm;
+
+	spin_lock_init(&rpm->debug.lock);
+}
+
+static noinline depot_stack_handle_t
+track_intel_runtime_pm_wakeref(struct drm_i915_private *i915)
+{
+	struct i915_runtime_pm *rpm = &i915->runtime_pm;
+	depot_stack_handle_t stack, *stacks;
+	unsigned long flags;
+
+	if (!HAS_RUNTIME_PM(i915))
+		return -1;
+
+	stack = __save_depot_stack();
+	if (!stack)
+		return -1;
+
+	spin_lock_irqsave(&rpm->debug.lock, flags);
+
+	if (!rpm->debug.count)
+		rpm->debug.last_acquire = stack;
+
+	stacks = krealloc(rpm->debug.owners,
+			  (rpm->debug.count + 1) * sizeof(*stacks),
+			  GFP_NOWAIT | __GFP_NOWARN);
+	if (stacks) {
+		stacks[rpm->debug.count++] = stack;
+		rpm->debug.owners = stacks;
+	} else {
+		stack = -1;
+	}
+
+	spin_unlock_irqrestore(&rpm->debug.lock, flags);
+
+	return stack;
+}
+
+static void untrack_intel_runtime_pm_wakeref(struct drm_i915_private *i915,
+					     depot_stack_handle_t stack)
+{
+	struct i915_runtime_pm *rpm = &i915->runtime_pm;
+	unsigned long flags, n;
+	bool found = false;
+
+	if (unlikely(stack == -1))
+		return;
+
+	spin_lock_irqsave(&rpm->debug.lock, flags);
+	for (n = rpm->debug.count; n--; ) {
+		if (rpm->debug.owners[n] == stack) {
+			memmove(rpm->debug.owners + n,
+				rpm->debug.owners + n + 1,
+				(--rpm->debug.count - n) * sizeof(stack));
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&rpm->debug.lock, flags);
+
+	if (WARN(!found,
+		 "Unmatched wakeref (tracking %lu), count %u\n",
+		 rpm->debug.count, atomic_read(&rpm->wakeref_count))) {
+		char *buf;
+
+		buf = kmalloc(PAGE_SIZE, GFP_NOWAIT | __GFP_NOWARN);
+		if (!buf)
+			return;
+
+		__print_depot_stack(stack, buf, PAGE_SIZE, 2);
+		DRM_DEBUG_DRIVER("wakeref %x from\n%s", stack, buf);
+
+		stack = READ_ONCE(rpm->debug.last_release);
+		if (stack) {
+			__print_depot_stack(stack, buf, PAGE_SIZE, 2);
+			DRM_DEBUG_DRIVER("wakeref last released at\n%s", buf);
+		}
+
+		kfree(buf);
+	}
+}
+
+static int cmphandle(const void *_a, const void *_b)
+{
+	const depot_stack_handle_t * const a = _a, * const b = _b;
+
+	if (*a < *b)
+		return -1;
+	else if (*a > *b)
+		return 1;
+	else
+		return 0;
+}
+
+static void
+__print_intel_runtime_pm_wakeref(struct drm_printer *p,
+				 const struct intel_runtime_pm_debug *dbg)
+{
+	unsigned long i;
+	char *buf;
+
+	buf = kmalloc(PAGE_SIZE, GFP_NOWAIT | __GFP_NOWARN);
+	if (!buf)
+		return;
+
+	if (dbg->last_acquire) {
+		__print_depot_stack(dbg->last_acquire, buf, PAGE_SIZE, 2);
+		drm_printf(p, "Wakeref last acquired:\n%s", buf);
+	}
+
+	if (dbg->last_release) {
+		__print_depot_stack(dbg->last_release, buf, PAGE_SIZE, 2);
+		drm_printf(p, "Wakeref last released:\n%s", buf);
+	}
+
+	drm_printf(p, "Wakeref count: %lu\n", dbg->count);
+
+	sort(dbg->owners, dbg->count, sizeof(*dbg->owners), cmphandle, NULL);
+
+	for (i = 0; i < dbg->count; i++) {
+		depot_stack_handle_t stack = dbg->owners[i];
+		unsigned long rep;
+
+		rep = 1;
+		while (i + 1 < dbg->count && dbg->owners[i + 1] == stack)
+			rep++, i++;
+		__print_depot_stack(stack, buf, PAGE_SIZE, 2);
+		drm_printf(p, "Wakeref x%lu taken at:\n%s", rep, buf);
+	}
+
+	kfree(buf);
+}
+
+static noinline void
+__untrack_all_wakerefs(struct intel_runtime_pm_debug *debug,
+		       struct intel_runtime_pm_debug *saved)
+{
+	*saved = *debug;
+
+	debug->owners = NULL;
+	debug->count = 0;
+	debug->last_release = __save_depot_stack();
+}
+
+static void
+dump_and_free_wakeref_tracking(struct intel_runtime_pm_debug *debug)
+{
+	struct drm_printer p;
+
+	if (!debug->count)
+		return;
+
+	p = drm_debug_printer("i915");
+	__print_intel_runtime_pm_wakeref(&p, debug);
+
+	kfree(debug->owners);
+}
+
+static noinline void
+__intel_wakeref_dec_and_check_tracking(struct drm_i915_private *i915)
+{
+	struct i915_runtime_pm *rpm = &i915->runtime_pm;
+	struct intel_runtime_pm_debug dbg = {};
+	unsigned long flags;
+
+	if (!atomic_dec_and_lock_irqsave(&rpm->wakeref_count,
+					 &rpm->debug.lock,
+					 flags))
+		return;
+
+	__untrack_all_wakerefs(&rpm->debug, &dbg);
+	spin_unlock_irqrestore(&rpm->debug.lock, flags);
+
+	dump_and_free_wakeref_tracking(&dbg);
+}
+
+static noinline void
+untrack_all_intel_runtime_pm_wakerefs(struct drm_i915_private *i915)
+{
+	struct i915_runtime_pm *rpm = &i915->runtime_pm;
+	struct intel_runtime_pm_debug dbg = {};
+	unsigned long flags;
+
+	spin_lock_irqsave(&rpm->debug.lock, flags);
+	__untrack_all_wakerefs(&rpm->debug, &dbg);
+	spin_unlock_irqrestore(&rpm->debug.lock, flags);
+
+	dump_and_free_wakeref_tracking(&dbg);
+}
+
+void print_intel_runtime_pm_wakeref(struct drm_i915_private *i915,
+				    struct drm_printer *p)
+{
+	struct intel_runtime_pm_debug dbg = {};
+
+	do {
+		struct i915_runtime_pm *rpm = &i915->runtime_pm;
+		unsigned long alloc = dbg.count;
+		depot_stack_handle_t *s;
+
+		spin_lock_irq(&rpm->debug.lock);
+		dbg.count = rpm->debug.count;
+		if (dbg.count <= alloc) {
+			memcpy(dbg.owners,
+			       rpm->debug.owners,
+			       dbg.count * sizeof(*s));
+		}
+		dbg.last_acquire = rpm->debug.last_acquire;
+		dbg.last_release = rpm->debug.last_release;
+		spin_unlock_irq(&rpm->debug.lock);
+		if (dbg.count <= alloc)
+			break;
+
+		s = krealloc(dbg.owners,
+			     dbg.count * sizeof(*s),
+			     GFP_NOWAIT | __GFP_NOWARN);
+		if (!s)
+			goto out;
+
+		dbg.owners = s;
+	} while (1);
+
+	__print_intel_runtime_pm_wakeref(p, &dbg);
+
+out:
+	kfree(dbg.owners);
+}
+
+#else
+
+static void init_intel_runtime_pm_wakeref(struct drm_i915_private *i915)
+{
+}
+
+static depot_stack_handle_t
+track_intel_runtime_pm_wakeref(struct drm_i915_private *i915)
+{
+	return -1;
+}
+
+static void untrack_intel_runtime_pm_wakeref(struct drm_i915_private *i915,
+					     intel_wakeref_t wref)
+{
+}
+
+static void
+__intel_wakeref_dec_and_check_tracking(struct drm_i915_private *i915)
+{
+	atomic_dec(&i915->runtime_pm.wakeref_count);
+}
+
+static void
+untrack_all_intel_runtime_pm_wakerefs(struct drm_i915_private *i915)
+{
+}
+
+#endif
+
+static void
+intel_runtime_pm_acquire(struct drm_i915_private *i915, bool wakelock)
+{
+	struct i915_runtime_pm *rpm = &i915->runtime_pm;
+
+	if (wakelock) {
+		atomic_add(1 + INTEL_RPM_WAKELOCK_BIAS, &rpm->wakeref_count);
+		assert_rpm_wakelock_held(i915);
+	} else {
+		atomic_inc(&rpm->wakeref_count);
+		assert_rpm_raw_wakeref_held(i915);
+	}
+}
+
+static void
+intel_runtime_pm_release(struct drm_i915_private *i915, int wakelock)
+{
+	struct i915_runtime_pm *rpm = &i915->runtime_pm;
+
+	if (wakelock) {
+		assert_rpm_wakelock_held(i915);
+		atomic_sub(INTEL_RPM_WAKELOCK_BIAS, &rpm->wakeref_count);
+	} else {
+		assert_rpm_raw_wakeref_held(i915);
+	}
+
+	__intel_wakeref_dec_and_check_tracking(i915);
+}
+
 bool intel_display_power_well_is_enabled(struct drm_i915_private *dev_priv,
 					 enum i915_power_well_id power_well_id);
 
@@ -56,6 +398,8 @@ const char *
 intel_display_power_domain_str(enum intel_display_power_domain domain)
 {
 	switch (domain) {
+	case POWER_DOMAIN_DISPLAY_CORE:
+		return "DISPLAY_CORE";
 	case POWER_DOMAIN_PIPE_A:
 		return "PIPE_A";
 	case POWER_DOMAIN_PIPE_B:
@@ -116,8 +460,6 @@ intel_display_power_domain_str(enum intel_display_power_domain domain)
 		return "VGA";
 	case POWER_DOMAIN_AUDIO:
 		return "AUDIO";
-	case POWER_DOMAIN_PLLS:
-		return "PLLS";
 	case POWER_DOMAIN_AUX_A:
 		return "AUX_A";
 	case POWER_DOMAIN_AUX_B:
@@ -301,7 +643,7 @@ static void hsw_wait_for_power_well_enable(struct drm_i915_private *dev_priv,
 	int pw_idx = power_well->desc->hsw.idx;
 
 	/* Timeout for PW1:10 us, AUX:not specified, other PWs:20 us. */
-	WARN_ON(intel_wait_for_register(dev_priv,
+	WARN_ON(intel_wait_for_register(&dev_priv->uncore,
 					regs->driver,
 					HSW_PWR_WELL_CTL_STATE(pw_idx),
 					HSW_PWR_WELL_CTL_STATE(pw_idx),
@@ -356,7 +698,7 @@ static void gen9_wait_for_power_well_fuses(struct drm_i915_private *dev_priv,
 					   enum skl_power_gate pg)
 {
 	/* Timeout 5us for PG#0, for other PGs 1us */
-	WARN_ON(intel_wait_for_register(dev_priv, SKL_FUSE_STATUS,
+	WARN_ON(intel_wait_for_register(&dev_priv->uncore, SKL_FUSE_STATUS,
 					SKL_FUSE_PG_DIST_STATUS(pg),
 					SKL_FUSE_PG_DIST_STATUS(pg), 1));
 }
@@ -509,7 +851,7 @@ static bool hsw_power_well_enabled(struct drm_i915_private *dev_priv,
 	 * BIOS's own request bits, which are forced-on for these power wells
 	 * when exiting DC5/6.
 	 */
-	if (IS_GEN9(dev_priv) && !IS_GEN9_LP(dev_priv) &&
+	if (IS_GEN(dev_priv, 9) && !IS_GEN9_LP(dev_priv) &&
 	    (id == SKL_DISP_PW_1 || id == SKL_DISP_PW_MISC_IO))
 		val |= I915_READ(regs->bios);
 
@@ -639,10 +981,10 @@ void gen9_sanitize_dc_state(struct drm_i915_private *dev_priv)
  * back on and register state is restored. This is guaranteed by the MMIO write
  * to DC_STATE_EN blocking until the state is restored.
  */
-static void gen9_set_dc_state(struct drm_i915_private *dev_priv, uint32_t state)
+static void gen9_set_dc_state(struct drm_i915_private *dev_priv, u32 state)
 {
-	uint32_t val;
-	uint32_t mask;
+	u32 val;
+	u32 mask;
 
 	if (WARN_ON_ONCE(state & ~dev_priv->csr.allowed_dc_mask))
 		state &= dev_priv->csr.allowed_dc_mask;
@@ -866,7 +1208,7 @@ static void gen9_dc_off_power_well_enable(struct drm_i915_private *dev_priv,
 		 * PHY's HW context for port B is lost after DC transitions,
 		 * so we need to restore it manually.
 		 */
-		icl_combo_phys_init(dev_priv);
+		intel_combo_phy_init(dev_priv);
 }
 
 static void gen9_dc_off_power_well_disable(struct drm_i915_private *dev_priv,
@@ -941,7 +1283,7 @@ static void vlv_set_power_well(struct drm_i915_private *dev_priv,
 	state = enable ? PUNIT_PWRGT_PWR_ON(pw_idx) :
 			 PUNIT_PWRGT_PWR_GATE(pw_idx);
 
-	mutex_lock(&dev_priv->pcu_lock);
+	vlv_punit_get(dev_priv);
 
 #define COND \
 	((vlv_punit_read(dev_priv, PUNIT_REG_PWRGT_STATUS) & mask) == state)
@@ -962,7 +1304,7 @@ static void vlv_set_power_well(struct drm_i915_private *dev_priv,
 #undef COND
 
 out:
-	mutex_unlock(&dev_priv->pcu_lock);
+	vlv_punit_put(dev_priv);
 }
 
 static void vlv_power_well_enable(struct drm_i915_private *dev_priv,
@@ -989,7 +1331,7 @@ static bool vlv_power_well_enabled(struct drm_i915_private *dev_priv,
 	mask = PUNIT_PWRGT_MASK(pw_idx);
 	ctrl = PUNIT_PWRGT_PWR_ON(pw_idx);
 
-	mutex_lock(&dev_priv->pcu_lock);
+	vlv_punit_get(dev_priv);
 
 	state = vlv_punit_read(dev_priv, PUNIT_REG_PWRGT_STATUS) & mask;
 	/*
@@ -1008,7 +1350,7 @@ static bool vlv_power_well_enabled(struct drm_i915_private *dev_priv,
 	ctrl = vlv_punit_read(dev_priv, PUNIT_REG_PWRGT_CTRL) & mask;
 	WARN_ON(ctrl != state);
 
-	mutex_unlock(&dev_priv->pcu_lock);
+	vlv_punit_put(dev_priv);
 
 	return enabled;
 }
@@ -1257,7 +1599,7 @@ static void assert_chv_phy_status(struct drm_i915_private *dev_priv)
 	 * The PHY may be busy with some initial calibration and whatnot,
 	 * so the power state can take a while to actually change.
 	 */
-	if (intel_wait_for_register(dev_priv,
+	if (intel_wait_for_register(&dev_priv->uncore,
 				    DISPLAY_PHY_STATUS,
 				    phy_status_mask,
 				    phy_status,
@@ -1274,7 +1616,7 @@ static void chv_dpio_cmn_power_well_enable(struct drm_i915_private *dev_priv,
 {
 	enum dpio_phy phy;
 	enum pipe pipe;
-	uint32_t tmp;
+	u32 tmp;
 
 	WARN_ON_ONCE(power_well->desc->id != VLV_DISP_PW_DPIO_CMN_BC &&
 		     power_well->desc->id != CHV_DISP_PW_DPIO_CMN_D);
@@ -1292,14 +1634,14 @@ static void chv_dpio_cmn_power_well_enable(struct drm_i915_private *dev_priv,
 	vlv_set_power_well(dev_priv, power_well, true);
 
 	/* Poll for phypwrgood signal */
-	if (intel_wait_for_register(dev_priv,
+	if (intel_wait_for_register(&dev_priv->uncore,
 				    DISPLAY_PHY_STATUS,
 				    PHY_POWERGOOD(phy),
 				    PHY_POWERGOOD(phy),
 				    1))
 		DRM_ERROR("Display PHY %d is not power up\n", phy);
 
-	mutex_lock(&dev_priv->sb_lock);
+	vlv_dpio_get(dev_priv);
 
 	/* Enable dynamic power down */
 	tmp = vlv_dpio_read(dev_priv, pipe, CHV_CMN_DW28);
@@ -1322,7 +1664,7 @@ static void chv_dpio_cmn_power_well_enable(struct drm_i915_private *dev_priv,
 		vlv_dpio_write(dev_priv, pipe, CHV_CMN_DW30, tmp);
 	}
 
-	mutex_unlock(&dev_priv->sb_lock);
+	vlv_dpio_put(dev_priv);
 
 	dev_priv->chv_phy_control |= PHY_COM_LANE_RESET_DEASSERT(phy);
 	I915_WRITE(DISPLAY_PHY_CONTROL, dev_priv->chv_phy_control);
@@ -1385,9 +1727,9 @@ static void assert_chv_phy_powergate(struct drm_i915_private *dev_priv, enum dpi
 	else
 		reg = _CHV_CMN_DW6_CH1;
 
-	mutex_lock(&dev_priv->sb_lock);
+	vlv_dpio_get(dev_priv);
 	val = vlv_dpio_read(dev_priv, pipe, reg);
-	mutex_unlock(&dev_priv->sb_lock);
+	vlv_dpio_put(dev_priv);
 
 	/*
 	 * This assumes !override is only used when the port is disabled.
@@ -1494,9 +1836,9 @@ static bool chv_pipe_power_well_enabled(struct drm_i915_private *dev_priv,
 	bool enabled;
 	u32 state, ctrl;
 
-	mutex_lock(&dev_priv->pcu_lock);
+	vlv_punit_get(dev_priv);
 
-	state = vlv_punit_read(dev_priv, PUNIT_REG_DSPFREQ) & DP_SSS_MASK(pipe);
+	state = vlv_punit_read(dev_priv, PUNIT_REG_DSPSSPM) & DP_SSS_MASK(pipe);
 	/*
 	 * We only ever set the power-on and power-gate states, anything
 	 * else is unexpected.
@@ -1508,10 +1850,10 @@ static bool chv_pipe_power_well_enabled(struct drm_i915_private *dev_priv,
 	 * A transient state at this point would mean some unexpected party
 	 * is poking at the power controls too.
 	 */
-	ctrl = vlv_punit_read(dev_priv, PUNIT_REG_DSPFREQ) & DP_SSC_MASK(pipe);
+	ctrl = vlv_punit_read(dev_priv, PUNIT_REG_DSPSSPM) & DP_SSC_MASK(pipe);
 	WARN_ON(ctrl << 16 != state);
 
-	mutex_unlock(&dev_priv->pcu_lock);
+	vlv_punit_put(dev_priv);
 
 	return enabled;
 }
@@ -1526,28 +1868,28 @@ static void chv_set_pipe_power_well(struct drm_i915_private *dev_priv,
 
 	state = enable ? DP_SSS_PWR_ON(pipe) : DP_SSS_PWR_GATE(pipe);
 
-	mutex_lock(&dev_priv->pcu_lock);
+	vlv_punit_get(dev_priv);
 
 #define COND \
-	((vlv_punit_read(dev_priv, PUNIT_REG_DSPFREQ) & DP_SSS_MASK(pipe)) == state)
+	((vlv_punit_read(dev_priv, PUNIT_REG_DSPSSPM) & DP_SSS_MASK(pipe)) == state)
 
 	if (COND)
 		goto out;
 
-	ctrl = vlv_punit_read(dev_priv, PUNIT_REG_DSPFREQ);
+	ctrl = vlv_punit_read(dev_priv, PUNIT_REG_DSPSSPM);
 	ctrl &= ~DP_SSC_MASK(pipe);
 	ctrl |= enable ? DP_SSC_PWR_ON(pipe) : DP_SSC_PWR_GATE(pipe);
-	vlv_punit_write(dev_priv, PUNIT_REG_DSPFREQ, ctrl);
+	vlv_punit_write(dev_priv, PUNIT_REG_DSPSSPM, ctrl);
 
 	if (wait_for(COND, 100))
 		DRM_ERROR("timeout setting power well state %08x (%08x)\n",
 			  state,
-			  vlv_punit_read(dev_priv, PUNIT_REG_DSPFREQ));
+			  vlv_punit_read(dev_priv, PUNIT_REG_DSPSSPM));
 
 #undef COND
 
 out:
-	mutex_unlock(&dev_priv->pcu_lock);
+	vlv_punit_put(dev_priv);
 }
 
 static void chv_pipe_power_well_enable(struct drm_i915_private *dev_priv,
@@ -1566,12 +1908,134 @@ static void chv_pipe_power_well_disable(struct drm_i915_private *dev_priv,
 	chv_set_pipe_power_well(dev_priv, power_well, false);
 }
 
+static u64 __async_put_domains_mask(struct i915_power_domains *power_domains)
+{
+	return power_domains->async_put_domains[0] |
+	       power_domains->async_put_domains[1];
+}
+
+#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_RUNTIME_PM)
+
+static bool
+assert_async_put_domain_masks_disjoint(struct i915_power_domains *power_domains)
+{
+	return !WARN_ON(power_domains->async_put_domains[0] &
+			power_domains->async_put_domains[1]);
+}
+
+static bool
+__async_put_domains_state_ok(struct i915_power_domains *power_domains)
+{
+	enum intel_display_power_domain domain;
+	bool err = false;
+
+	err |= !assert_async_put_domain_masks_disjoint(power_domains);
+	err |= WARN_ON(!!power_domains->async_put_wakeref !=
+		       !!__async_put_domains_mask(power_domains));
+
+	for_each_power_domain(domain, __async_put_domains_mask(power_domains))
+		err |= WARN_ON(power_domains->domain_use_count[domain] != 1);
+
+	return !err;
+}
+
+static void print_power_domains(struct i915_power_domains *power_domains,
+				const char *prefix, u64 mask)
+{
+	enum intel_display_power_domain domain;
+
+	DRM_DEBUG_DRIVER("%s (%lu):\n", prefix, hweight64(mask));
+	for_each_power_domain(domain, mask)
+		DRM_DEBUG_DRIVER("%s use_count %d\n",
+				 intel_display_power_domain_str(domain),
+				 power_domains->domain_use_count[domain]);
+}
+
+static void
+print_async_put_domains_state(struct i915_power_domains *power_domains)
+{
+	DRM_DEBUG_DRIVER("async_put_wakeref %u\n",
+			 power_domains->async_put_wakeref);
+
+	print_power_domains(power_domains, "async_put_domains[0]",
+			    power_domains->async_put_domains[0]);
+	print_power_domains(power_domains, "async_put_domains[1]",
+			    power_domains->async_put_domains[1]);
+}
+
+static void
+verify_async_put_domains_state(struct i915_power_domains *power_domains)
+{
+	if (!__async_put_domains_state_ok(power_domains))
+		print_async_put_domains_state(power_domains);
+}
+
+#else
+
+static void
+assert_async_put_domain_masks_disjoint(struct i915_power_domains *power_domains)
+{
+}
+
+static void
+verify_async_put_domains_state(struct i915_power_domains *power_domains)
+{
+}
+
+#endif /* CONFIG_DRM_I915_DEBUG_RUNTIME_PM */
+
+static u64 async_put_domains_mask(struct i915_power_domains *power_domains)
+{
+	assert_async_put_domain_masks_disjoint(power_domains);
+
+	return __async_put_domains_mask(power_domains);
+}
+
+static void
+async_put_domains_clear_domain(struct i915_power_domains *power_domains,
+			       enum intel_display_power_domain domain)
+{
+	assert_async_put_domain_masks_disjoint(power_domains);
+
+	power_domains->async_put_domains[0] &= ~BIT_ULL(domain);
+	power_domains->async_put_domains[1] &= ~BIT_ULL(domain);
+}
+
+static bool
+intel_display_power_grab_async_put_ref(struct drm_i915_private *dev_priv,
+				       enum intel_display_power_domain domain)
+{
+	struct i915_power_domains *power_domains = &dev_priv->power_domains;
+	bool ret = false;
+
+	if (!(async_put_domains_mask(power_domains) & BIT_ULL(domain)))
+		goto out_verify;
+
+	async_put_domains_clear_domain(power_domains, domain);
+
+	ret = true;
+
+	if (async_put_domains_mask(power_domains))
+		goto out_verify;
+
+	cancel_delayed_work(&power_domains->async_put_work);
+	intel_runtime_pm_put_raw(dev_priv,
+				 fetch_and_zero(&power_domains->async_put_wakeref));
+out_verify:
+	verify_async_put_domains_state(power_domains);
+
+	return ret;
+}
+
 static void
 __intel_display_power_get_domain(struct drm_i915_private *dev_priv,
 				 enum intel_display_power_domain domain)
 {
 	struct i915_power_domains *power_domains = &dev_priv->power_domains;
 	struct i915_power_well *power_well;
+
+	if (intel_display_power_grab_async_put_ref(dev_priv, domain))
+		return;
 
 	for_each_power_domain_well(dev_priv, power_well, BIT_ULL(domain))
 		intel_power_well_get(dev_priv, power_well);
@@ -1591,18 +2055,17 @@ __intel_display_power_get_domain(struct drm_i915_private *dev_priv,
  * Any power domain reference obtained by this function must have a symmetric
  * call to intel_display_power_put() to release the reference again.
  */
-void intel_display_power_get(struct drm_i915_private *dev_priv,
-			     enum intel_display_power_domain domain)
+intel_wakeref_t intel_display_power_get(struct drm_i915_private *dev_priv,
+					enum intel_display_power_domain domain)
 {
 	struct i915_power_domains *power_domains = &dev_priv->power_domains;
-
-	intel_runtime_pm_get(dev_priv);
+	intel_wakeref_t wakeref = intel_runtime_pm_get(dev_priv);
 
 	mutex_lock(&power_domains->lock);
-
 	__intel_display_power_get_domain(dev_priv, domain);
-
 	mutex_unlock(&power_domains->lock);
+
+	return wakeref;
 }
 
 /**
@@ -1617,13 +2080,16 @@ void intel_display_power_get(struct drm_i915_private *dev_priv,
  * Any power domain reference obtained by this function must have a symmetric
  * call to intel_display_power_put() to release the reference again.
  */
-bool intel_display_power_get_if_enabled(struct drm_i915_private *dev_priv,
-					enum intel_display_power_domain domain)
+intel_wakeref_t
+intel_display_power_get_if_enabled(struct drm_i915_private *dev_priv,
+				   enum intel_display_power_domain domain)
 {
 	struct i915_power_domains *power_domains = &dev_priv->power_domains;
+	intel_wakeref_t wakeref;
 	bool is_enabled;
 
-	if (!intel_runtime_pm_get_if_in_use(dev_priv))
+	wakeref = intel_runtime_pm_get_if_in_use(dev_priv);
+	if (!wakeref)
 		return false;
 
 	mutex_lock(&power_domains->lock);
@@ -1637,43 +2103,268 @@ bool intel_display_power_get_if_enabled(struct drm_i915_private *dev_priv,
 
 	mutex_unlock(&power_domains->lock);
 
-	if (!is_enabled)
-		intel_runtime_pm_put(dev_priv);
+	if (!is_enabled) {
+		intel_runtime_pm_put(dev_priv, wakeref);
+		wakeref = 0;
+	}
 
-	return is_enabled;
+	return wakeref;
+}
+
+static void
+__intel_display_power_put_domain(struct drm_i915_private *dev_priv,
+				 enum intel_display_power_domain domain)
+{
+	struct i915_power_domains *power_domains;
+	struct i915_power_well *power_well;
+	const char *name = intel_display_power_domain_str(domain);
+
+	power_domains = &dev_priv->power_domains;
+
+	WARN(!power_domains->domain_use_count[domain],
+	     "Use count on domain %s is already zero\n",
+	     name);
+	WARN(async_put_domains_mask(power_domains) & BIT_ULL(domain),
+	     "Async disabling of domain %s is pending\n",
+	     name);
+
+	power_domains->domain_use_count[domain]--;
+
+	for_each_power_domain_well_reverse(dev_priv, power_well, BIT_ULL(domain))
+		intel_power_well_put(dev_priv, power_well);
+}
+
+static void __intel_display_power_put(struct drm_i915_private *dev_priv,
+				      enum intel_display_power_domain domain)
+{
+	struct i915_power_domains *power_domains = &dev_priv->power_domains;
+
+	mutex_lock(&power_domains->lock);
+	__intel_display_power_put_domain(dev_priv, domain);
+	mutex_unlock(&power_domains->lock);
 }
 
 /**
- * intel_display_power_put - release a power domain reference
+ * intel_display_power_put_unchecked - release an unchecked power domain reference
  * @dev_priv: i915 device instance
  * @domain: power domain to reference
  *
  * This function drops the power domain reference obtained by
  * intel_display_power_get() and might power down the corresponding hardware
  * block right away if this is the last reference.
+ *
+ * This function exists only for historical reasons and should be avoided in
+ * new code, as the correctness of its use cannot be checked. Always use
+ * intel_display_power_put() instead.
  */
-void intel_display_power_put(struct drm_i915_private *dev_priv,
-			     enum intel_display_power_domain domain)
+void intel_display_power_put_unchecked(struct drm_i915_private *dev_priv,
+				       enum intel_display_power_domain domain)
 {
-	struct i915_power_domains *power_domains;
-	struct i915_power_well *power_well;
+	__intel_display_power_put(dev_priv, domain);
+	intel_runtime_pm_put_unchecked(dev_priv);
+}
 
-	power_domains = &dev_priv->power_domains;
+static void
+queue_async_put_domains_work(struct i915_power_domains *power_domains,
+			     intel_wakeref_t wakeref)
+{
+	WARN_ON(power_domains->async_put_wakeref);
+	power_domains->async_put_wakeref = wakeref;
+	WARN_ON(!queue_delayed_work(system_unbound_wq,
+				    &power_domains->async_put_work,
+				    msecs_to_jiffies(100)));
+}
+
+static void
+release_async_put_domains(struct i915_power_domains *power_domains, u64 mask)
+{
+	struct drm_i915_private *dev_priv =
+		container_of(power_domains, struct drm_i915_private,
+			     power_domains);
+	enum intel_display_power_domain domain;
+	intel_wakeref_t wakeref;
+
+	/*
+	 * The caller must hold already raw wakeref, upgrade that to a proper
+	 * wakeref to make the state checker happy about the HW access during
+	 * power well disabling.
+	 */
+	assert_rpm_raw_wakeref_held(dev_priv);
+	wakeref = intel_runtime_pm_get(dev_priv);
+
+	for_each_power_domain(domain, mask) {
+		/* Clear before put, so put's sanity check is happy. */
+		async_put_domains_clear_domain(power_domains, domain);
+		__intel_display_power_put_domain(dev_priv, domain);
+	}
+
+	intel_runtime_pm_put(dev_priv, wakeref);
+}
+
+static void
+intel_display_power_put_async_work(struct work_struct *work)
+{
+	struct drm_i915_private *dev_priv =
+		container_of(work, struct drm_i915_private,
+			     power_domains.async_put_work.work);
+	struct i915_power_domains *power_domains = &dev_priv->power_domains;
+	intel_wakeref_t new_work_wakeref = intel_runtime_pm_get_raw(dev_priv);
+	intel_wakeref_t old_work_wakeref = 0;
 
 	mutex_lock(&power_domains->lock);
 
-	WARN(!power_domains->domain_use_count[domain],
-	     "Use count on domain %s is already zero\n",
-	     intel_display_power_domain_str(domain));
-	power_domains->domain_use_count[domain]--;
+	/*
+	 * Bail out if all the domain refs pending to be released were grabbed
+	 * by subsequent gets or a flush_work.
+	 */
+	old_work_wakeref = fetch_and_zero(&power_domains->async_put_wakeref);
+	if (!old_work_wakeref)
+		goto out_verify;
 
-	for_each_power_domain_well_reverse(dev_priv, power_well, BIT_ULL(domain))
-		intel_power_well_put(dev_priv, power_well);
+	release_async_put_domains(power_domains,
+				  power_domains->async_put_domains[0]);
+
+	/* Requeue the work if more domains were async put meanwhile. */
+	if (power_domains->async_put_domains[1]) {
+		power_domains->async_put_domains[0] =
+			fetch_and_zero(&power_domains->async_put_domains[1]);
+		queue_async_put_domains_work(power_domains,
+					     fetch_and_zero(&new_work_wakeref));
+	}
+
+out_verify:
+	verify_async_put_domains_state(power_domains);
 
 	mutex_unlock(&power_domains->lock);
 
-	intel_runtime_pm_put(dev_priv);
+	if (old_work_wakeref)
+		intel_runtime_pm_put_raw(dev_priv, old_work_wakeref);
+	if (new_work_wakeref)
+		intel_runtime_pm_put_raw(dev_priv, new_work_wakeref);
 }
+
+/**
+ * intel_display_power_put_async - release a power domain reference asynchronously
+ * @i915: i915 device instance
+ * @domain: power domain to reference
+ * @wakeref: wakeref acquired for the reference that is being released
+ *
+ * This function drops the power domain reference obtained by
+ * intel_display_power_get*() and schedules a work to power down the
+ * corresponding hardware block if this is the last reference.
+ */
+void __intel_display_power_put_async(struct drm_i915_private *i915,
+				     enum intel_display_power_domain domain,
+				     intel_wakeref_t wakeref)
+{
+	struct i915_power_domains *power_domains = &i915->power_domains;
+	intel_wakeref_t work_wakeref = intel_runtime_pm_get_raw(i915);
+
+	mutex_lock(&power_domains->lock);
+
+	if (power_domains->domain_use_count[domain] > 1) {
+		__intel_display_power_put_domain(i915, domain);
+
+		goto out_verify;
+	}
+
+	WARN_ON(power_domains->domain_use_count[domain] != 1);
+
+	/* Let a pending work requeue itself or queue a new one. */
+	if (power_domains->async_put_wakeref) {
+		power_domains->async_put_domains[1] |= BIT_ULL(domain);
+	} else {
+		power_domains->async_put_domains[0] |= BIT_ULL(domain);
+		queue_async_put_domains_work(power_domains,
+					     fetch_and_zero(&work_wakeref));
+	}
+
+out_verify:
+	verify_async_put_domains_state(power_domains);
+
+	mutex_unlock(&power_domains->lock);
+
+	if (work_wakeref)
+		intel_runtime_pm_put_raw(i915, work_wakeref);
+
+	intel_runtime_pm_put(i915, wakeref);
+}
+
+/**
+ * intel_display_power_flush_work - flushes the async display power disabling work
+ * @i915: i915 device instance
+ *
+ * Flushes any pending work that was scheduled by a preceding
+ * intel_display_power_put_async() call, completing the disabling of the
+ * corresponding power domains.
+ *
+ * Note that the work handler function may still be running after this
+ * function returns; to ensure that the work handler isn't running use
+ * intel_display_power_flush_work_sync() instead.
+ */
+void intel_display_power_flush_work(struct drm_i915_private *i915)
+{
+	struct i915_power_domains *power_domains = &i915->power_domains;
+	intel_wakeref_t work_wakeref;
+
+	mutex_lock(&power_domains->lock);
+
+	work_wakeref = fetch_and_zero(&power_domains->async_put_wakeref);
+	if (!work_wakeref)
+		goto out_verify;
+
+	release_async_put_domains(power_domains,
+				  async_put_domains_mask(power_domains));
+	cancel_delayed_work(&power_domains->async_put_work);
+
+out_verify:
+	verify_async_put_domains_state(power_domains);
+
+	mutex_unlock(&power_domains->lock);
+
+	if (work_wakeref)
+		intel_runtime_pm_put_raw(i915, work_wakeref);
+}
+
+/**
+ * intel_display_power_flush_work_sync - flushes and syncs the async display power disabling work
+ * @i915: i915 device instance
+ *
+ * Like intel_display_power_flush_work(), but also ensure that the work
+ * handler function is not running any more when this function returns.
+ */
+static void
+intel_display_power_flush_work_sync(struct drm_i915_private *i915)
+{
+	struct i915_power_domains *power_domains = &i915->power_domains;
+
+	intel_display_power_flush_work(i915);
+	cancel_delayed_work_sync(&power_domains->async_put_work);
+
+	verify_async_put_domains_state(power_domains);
+
+	WARN_ON(power_domains->async_put_wakeref);
+}
+
+#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_RUNTIME_PM)
+/**
+ * intel_display_power_put - release a power domain reference
+ * @dev_priv: i915 device instance
+ * @domain: power domain to reference
+ * @wakeref: wakeref acquired for the reference that is being released
+ *
+ * This function drops the power domain reference obtained by
+ * intel_display_power_get() and might power down the corresponding hardware
+ * block right away if this is the last reference.
+ */
+void intel_display_power_put(struct drm_i915_private *dev_priv,
+			     enum intel_display_power_domain domain,
+			     intel_wakeref_t wakeref)
+{
+	__intel_display_power_put(dev_priv, domain);
+	intel_runtime_pm_put(dev_priv, wakeref);
+}
+#endif
 
 #define I830_PIPES_POWER_DOMAINS (		\
 	BIT_ULL(POWER_DOMAIN_PIPE_A) |		\
@@ -1685,6 +2376,7 @@ void intel_display_power_put(struct drm_i915_private *dev_priv,
 	BIT_ULL(POWER_DOMAIN_INIT))
 
 #define VLV_DISPLAY_POWER_DOMAINS (		\
+	BIT_ULL(POWER_DOMAIN_DISPLAY_CORE) |	\
 	BIT_ULL(POWER_DOMAIN_PIPE_A) |		\
 	BIT_ULL(POWER_DOMAIN_PIPE_B) |		\
 	BIT_ULL(POWER_DOMAIN_PIPE_A_PANEL_FITTER) |	\
@@ -1731,6 +2423,7 @@ void intel_display_power_put(struct drm_i915_private *dev_priv,
 	BIT_ULL(POWER_DOMAIN_INIT))
 
 #define CHV_DISPLAY_POWER_DOMAINS (		\
+	BIT_ULL(POWER_DOMAIN_DISPLAY_CORE) |	\
 	BIT_ULL(POWER_DOMAIN_PIPE_A) |		\
 	BIT_ULL(POWER_DOMAIN_PIPE_B) |		\
 	BIT_ULL(POWER_DOMAIN_PIPE_C) |		\
@@ -3043,10 +3736,10 @@ sanitize_disable_power_well_option(const struct drm_i915_private *dev_priv,
 	return 1;
 }
 
-static uint32_t get_allowed_dc_mask(const struct drm_i915_private *dev_priv,
-				    int enable_dc)
+static u32 get_allowed_dc_mask(const struct drm_i915_private *dev_priv,
+			       int enable_dc)
 {
-	uint32_t mask;
+	u32 mask;
 	int requested_dc;
 	int max_dc;
 
@@ -3058,7 +3751,7 @@ static uint32_t get_allowed_dc_mask(const struct drm_i915_private *dev_priv,
 		 * suspend/resume, so allow it unconditionally.
 		 */
 		mask = DC_STATE_EN_DC9;
-	} else if (IS_GEN10(dev_priv) || IS_GEN9_BC(dev_priv)) {
+	} else if (IS_GEN(dev_priv, 10) || IS_GEN9_BC(dev_priv)) {
 		max_dc = 2;
 		mask = 0;
 	} else if (IS_GEN9_LP(dev_priv)) {
@@ -3153,11 +3846,14 @@ int intel_power_domains_init(struct drm_i915_private *dev_priv)
 
 	mutex_init(&power_domains->lock);
 
+	INIT_DELAYED_WORK(&power_domains->async_put_work,
+			  intel_display_power_put_async_work);
+
 	/*
 	 * The enabling order will be from lower to higher indexed wells,
 	 * the disabling order is reversed.
 	 */
-	if (IS_ICELAKE(dev_priv)) {
+	if (IS_GEN(dev_priv, 11)) {
 		err = set_power_wells(power_domains, icl_power_wells);
 	} else if (IS_CANNONLAKE(dev_priv)) {
 		err = set_power_wells(power_domains, cnl_power_wells);
@@ -3291,7 +3987,11 @@ static void icl_dbuf_enable(struct drm_i915_private *dev_priv)
 	    !(I915_READ(DBUF_CTL_S2) & DBUF_POWER_STATE))
 		DRM_ERROR("DBuf power enable timeout\n");
 	else
-		dev_priv->wm.skl_hw.ddb.enabled_slices = 2;
+		/*
+		 * FIXME: for now pretend that we only have 1 slice, see
+		 * intel_enabled_dbuf_slices_num().
+		 */
+		dev_priv->wm.skl_hw.ddb.enabled_slices = 1;
 }
 
 static void icl_dbuf_disable(struct drm_i915_private *dev_priv)
@@ -3306,12 +4006,16 @@ static void icl_dbuf_disable(struct drm_i915_private *dev_priv)
 	    (I915_READ(DBUF_CTL_S2) & DBUF_POWER_STATE))
 		DRM_ERROR("DBuf power disable timeout!\n");
 	else
-		dev_priv->wm.skl_hw.ddb.enabled_slices = 0;
+		/*
+		 * FIXME: for now pretend that the first slice is always
+		 * enabled, see intel_enabled_dbuf_slices_num().
+		 */
+		dev_priv->wm.skl_hw.ddb.enabled_slices = 1;
 }
 
 static void icl_mbus_init(struct drm_i915_private *dev_priv)
 {
-	uint32_t val;
+	u32 val;
 
 	val = MBUS_ABOX_BT_CREDIT_POOL1(16) |
 	      MBUS_ABOX_BT_CREDIT_POOL2(16) |
@@ -3319,6 +4023,246 @@ static void icl_mbus_init(struct drm_i915_private *dev_priv)
 	      MBUS_ABOX_BW_CREDIT(1);
 
 	I915_WRITE(MBUS_ABOX_CTL, val);
+}
+
+static void hsw_assert_cdclk(struct drm_i915_private *dev_priv)
+{
+	u32 val = I915_READ(LCPLL_CTL);
+
+	/*
+	 * The LCPLL register should be turned on by the BIOS. For now
+	 * let's just check its state and print errors in case
+	 * something is wrong.  Don't even try to turn it on.
+	 */
+
+	if (val & LCPLL_CD_SOURCE_FCLK)
+		DRM_ERROR("CDCLK source is not LCPLL\n");
+
+	if (val & LCPLL_PLL_DISABLE)
+		DRM_ERROR("LCPLL is disabled\n");
+}
+
+static void assert_can_disable_lcpll(struct drm_i915_private *dev_priv)
+{
+	struct drm_device *dev = &dev_priv->drm;
+	struct intel_crtc *crtc;
+
+	for_each_intel_crtc(dev, crtc)
+		I915_STATE_WARN(crtc->active, "CRTC for pipe %c enabled\n",
+				pipe_name(crtc->pipe));
+
+	I915_STATE_WARN(I915_READ(HSW_PWR_WELL_CTL2),
+			"Display power well on\n");
+	I915_STATE_WARN(I915_READ(SPLL_CTL) & SPLL_PLL_ENABLE,
+			"SPLL enabled\n");
+	I915_STATE_WARN(I915_READ(WRPLL_CTL(0)) & WRPLL_PLL_ENABLE,
+			"WRPLL1 enabled\n");
+	I915_STATE_WARN(I915_READ(WRPLL_CTL(1)) & WRPLL_PLL_ENABLE,
+			"WRPLL2 enabled\n");
+	I915_STATE_WARN(I915_READ(PP_STATUS(0)) & PP_ON,
+			"Panel power on\n");
+	I915_STATE_WARN(I915_READ(BLC_PWM_CPU_CTL2) & BLM_PWM_ENABLE,
+			"CPU PWM1 enabled\n");
+	if (IS_HASWELL(dev_priv))
+		I915_STATE_WARN(I915_READ(HSW_BLC_PWM2_CTL) & BLM_PWM_ENABLE,
+				"CPU PWM2 enabled\n");
+	I915_STATE_WARN(I915_READ(BLC_PWM_PCH_CTL1) & BLM_PCH_PWM_ENABLE,
+			"PCH PWM1 enabled\n");
+	I915_STATE_WARN(I915_READ(UTIL_PIN_CTL) & UTIL_PIN_ENABLE,
+			"Utility pin enabled\n");
+	I915_STATE_WARN(I915_READ(PCH_GTC_CTL) & PCH_GTC_ENABLE,
+			"PCH GTC enabled\n");
+
+	/*
+	 * In theory we can still leave IRQs enabled, as long as only the HPD
+	 * interrupts remain enabled. We used to check for that, but since it's
+	 * gen-specific and since we only disable LCPLL after we fully disable
+	 * the interrupts, the check below should be enough.
+	 */
+	I915_STATE_WARN(intel_irqs_enabled(dev_priv), "IRQs enabled\n");
+}
+
+static u32 hsw_read_dcomp(struct drm_i915_private *dev_priv)
+{
+	if (IS_HASWELL(dev_priv))
+		return I915_READ(D_COMP_HSW);
+	else
+		return I915_READ(D_COMP_BDW);
+}
+
+static void hsw_write_dcomp(struct drm_i915_private *dev_priv, u32 val)
+{
+	if (IS_HASWELL(dev_priv)) {
+		if (sandybridge_pcode_write(dev_priv,
+					    GEN6_PCODE_WRITE_D_COMP, val))
+			DRM_DEBUG_KMS("Failed to write to D_COMP\n");
+	} else {
+		I915_WRITE(D_COMP_BDW, val);
+		POSTING_READ(D_COMP_BDW);
+	}
+}
+
+/*
+ * This function implements pieces of two sequences from BSpec:
+ * - Sequence for display software to disable LCPLL
+ * - Sequence for display software to allow package C8+
+ * The steps implemented here are just the steps that actually touch the LCPLL
+ * register. Callers should take care of disabling all the display engine
+ * functions, doing the mode unset, fixing interrupts, etc.
+ */
+static void hsw_disable_lcpll(struct drm_i915_private *dev_priv,
+			      bool switch_to_fclk, bool allow_power_down)
+{
+	u32 val;
+
+	assert_can_disable_lcpll(dev_priv);
+
+	val = I915_READ(LCPLL_CTL);
+
+	if (switch_to_fclk) {
+		val |= LCPLL_CD_SOURCE_FCLK;
+		I915_WRITE(LCPLL_CTL, val);
+
+		if (wait_for_us(I915_READ(LCPLL_CTL) &
+				LCPLL_CD_SOURCE_FCLK_DONE, 1))
+			DRM_ERROR("Switching to FCLK failed\n");
+
+		val = I915_READ(LCPLL_CTL);
+	}
+
+	val |= LCPLL_PLL_DISABLE;
+	I915_WRITE(LCPLL_CTL, val);
+	POSTING_READ(LCPLL_CTL);
+
+	if (intel_wait_for_register(&dev_priv->uncore, LCPLL_CTL,
+				    LCPLL_PLL_LOCK, 0, 1))
+		DRM_ERROR("LCPLL still locked\n");
+
+	val = hsw_read_dcomp(dev_priv);
+	val |= D_COMP_COMP_DISABLE;
+	hsw_write_dcomp(dev_priv, val);
+	ndelay(100);
+
+	if (wait_for((hsw_read_dcomp(dev_priv) &
+		      D_COMP_RCOMP_IN_PROGRESS) == 0, 1))
+		DRM_ERROR("D_COMP RCOMP still in progress\n");
+
+	if (allow_power_down) {
+		val = I915_READ(LCPLL_CTL);
+		val |= LCPLL_POWER_DOWN_ALLOW;
+		I915_WRITE(LCPLL_CTL, val);
+		POSTING_READ(LCPLL_CTL);
+	}
+}
+
+/*
+ * Fully restores LCPLL, disallowing power down and switching back to LCPLL
+ * source.
+ */
+static void hsw_restore_lcpll(struct drm_i915_private *dev_priv)
+{
+	u32 val;
+
+	val = I915_READ(LCPLL_CTL);
+
+	if ((val & (LCPLL_PLL_LOCK | LCPLL_PLL_DISABLE | LCPLL_CD_SOURCE_FCLK |
+		    LCPLL_POWER_DOWN_ALLOW)) == LCPLL_PLL_LOCK)
+		return;
+
+	/*
+	 * Make sure we're not on PC8 state before disabling PC8, otherwise
+	 * we'll hang the machine. To prevent PC8 state, just enable force_wake.
+	 */
+	intel_uncore_forcewake_get(&dev_priv->uncore, FORCEWAKE_ALL);
+
+	if (val & LCPLL_POWER_DOWN_ALLOW) {
+		val &= ~LCPLL_POWER_DOWN_ALLOW;
+		I915_WRITE(LCPLL_CTL, val);
+		POSTING_READ(LCPLL_CTL);
+	}
+
+	val = hsw_read_dcomp(dev_priv);
+	val |= D_COMP_COMP_FORCE;
+	val &= ~D_COMP_COMP_DISABLE;
+	hsw_write_dcomp(dev_priv, val);
+
+	val = I915_READ(LCPLL_CTL);
+	val &= ~LCPLL_PLL_DISABLE;
+	I915_WRITE(LCPLL_CTL, val);
+
+	if (intel_wait_for_register(&dev_priv->uncore, LCPLL_CTL,
+				    LCPLL_PLL_LOCK, LCPLL_PLL_LOCK, 5))
+		DRM_ERROR("LCPLL not locked yet\n");
+
+	if (val & LCPLL_CD_SOURCE_FCLK) {
+		val = I915_READ(LCPLL_CTL);
+		val &= ~LCPLL_CD_SOURCE_FCLK;
+		I915_WRITE(LCPLL_CTL, val);
+
+		if (wait_for_us((I915_READ(LCPLL_CTL) &
+				 LCPLL_CD_SOURCE_FCLK_DONE) == 0, 1))
+			DRM_ERROR("Switching back to LCPLL failed\n");
+	}
+
+	intel_uncore_forcewake_put(&dev_priv->uncore, FORCEWAKE_ALL);
+
+	intel_update_cdclk(dev_priv);
+	intel_dump_cdclk_state(&dev_priv->cdclk.hw, "Current CDCLK");
+}
+
+/*
+ * Package states C8 and deeper are really deep PC states that can only be
+ * reached when all the devices on the system allow it, so even if the graphics
+ * device allows PC8+, it doesn't mean the system will actually get to these
+ * states. Our driver only allows PC8+ when going into runtime PM.
+ *
+ * The requirements for PC8+ are that all the outputs are disabled, the power
+ * well is disabled and most interrupts are disabled, and these are also
+ * requirements for runtime PM. When these conditions are met, we manually do
+ * the other conditions: disable the interrupts, clocks and switch LCPLL refclk
+ * to Fclk. If we're in PC8+ and we get an non-hotplug interrupt, we can hard
+ * hang the machine.
+ *
+ * When we really reach PC8 or deeper states (not just when we allow it) we lose
+ * the state of some registers, so when we come back from PC8+ we need to
+ * restore this state. We don't get into PC8+ if we're not in RC6, so we don't
+ * need to take care of the registers kept by RC6. Notice that this happens even
+ * if we don't put the device in PCI D3 state (which is what currently happens
+ * because of the runtime PM support).
+ *
+ * For more, read "Display Sequences for Package C8" on the hardware
+ * documentation.
+ */
+void hsw_enable_pc8(struct drm_i915_private *dev_priv)
+{
+	u32 val;
+
+	DRM_DEBUG_KMS("Enabling package C8+\n");
+
+	if (HAS_PCH_LPT_LP(dev_priv)) {
+		val = I915_READ(SOUTH_DSPCLK_GATE_D);
+		val &= ~PCH_LP_PARTITION_LEVEL_DISABLE;
+		I915_WRITE(SOUTH_DSPCLK_GATE_D, val);
+	}
+
+	lpt_disable_clkout_dp(dev_priv);
+	hsw_disable_lcpll(dev_priv, true, true);
+}
+
+void hsw_disable_pc8(struct drm_i915_private *dev_priv)
+{
+	u32 val;
+
+	DRM_DEBUG_KMS("Disabling package C8+\n");
+
+	hsw_restore_lcpll(dev_priv);
+	intel_init_pch_refclk(dev_priv);
+
+	if (HAS_PCH_LPT_LP(dev_priv)) {
+		val = I915_READ(SOUTH_DSPCLK_GATE_D);
+		val |= PCH_LP_PARTITION_LEVEL_DISABLE;
+		I915_WRITE(SOUTH_DSPCLK_GATE_D, val);
+	}
 }
 
 static void intel_pch_reset_handshake(struct drm_i915_private *dev_priv,
@@ -3367,7 +4311,7 @@ static void skl_display_core_init(struct drm_i915_private *dev_priv,
 
 	mutex_unlock(&power_domains->lock);
 
-	skl_init_cdclk(dev_priv);
+	intel_cdclk_init(dev_priv);
 
 	gen9_dbuf_enable(dev_priv);
 
@@ -3384,7 +4328,7 @@ static void skl_display_core_uninit(struct drm_i915_private *dev_priv)
 
 	gen9_dbuf_disable(dev_priv);
 
-	skl_uninit_cdclk(dev_priv);
+	intel_cdclk_uninit(dev_priv);
 
 	/* The spec doesn't call for removing the reset handshake flag */
 	/* disable PG1 and Misc I/O */
@@ -3429,7 +4373,7 @@ void bxt_display_core_init(struct drm_i915_private *dev_priv,
 
 	mutex_unlock(&power_domains->lock);
 
-	bxt_init_cdclk(dev_priv);
+	intel_cdclk_init(dev_priv);
 
 	gen9_dbuf_enable(dev_priv);
 
@@ -3446,7 +4390,7 @@ void bxt_display_core_uninit(struct drm_i915_private *dev_priv)
 
 	gen9_dbuf_disable(dev_priv);
 
-	bxt_uninit_cdclk(dev_priv);
+	intel_cdclk_uninit(dev_priv);
 
 	/* The spec doesn't call for removing the reset handshake flag */
 
@@ -3476,7 +4420,7 @@ static void cnl_display_core_init(struct drm_i915_private *dev_priv, bool resume
 	intel_pch_reset_handshake(dev_priv, !HAS_PCH_NOP(dev_priv));
 
 	/* 2-3. */
-	cnl_combo_phys_init(dev_priv);
+	intel_combo_phy_init(dev_priv);
 
 	/*
 	 * 4. Enable Power Well 1 (PG1).
@@ -3488,7 +4432,7 @@ static void cnl_display_core_init(struct drm_i915_private *dev_priv, bool resume
 	mutex_unlock(&power_domains->lock);
 
 	/* 5. Enable CD clock */
-	cnl_init_cdclk(dev_priv);
+	intel_cdclk_init(dev_priv);
 
 	/* 6. Enable DBUF */
 	gen9_dbuf_enable(dev_priv);
@@ -3510,7 +4454,7 @@ static void cnl_display_core_uninit(struct drm_i915_private *dev_priv)
 	gen9_dbuf_disable(dev_priv);
 
 	/* 3. Disable CD clock */
-	cnl_uninit_cdclk(dev_priv);
+	intel_cdclk_uninit(dev_priv);
 
 	/*
 	 * 4. Disable Power Well 1 (PG1).
@@ -3525,7 +4469,7 @@ static void cnl_display_core_uninit(struct drm_i915_private *dev_priv)
 	usleep_range(10, 30);		/* 10 us delay per Bspec */
 
 	/* 5. */
-	cnl_combo_phys_uninit(dev_priv);
+	intel_combo_phy_uninit(dev_priv);
 }
 
 void icl_display_core_init(struct drm_i915_private *dev_priv,
@@ -3539,11 +4483,11 @@ void icl_display_core_init(struct drm_i915_private *dev_priv,
 	/* 1. Enable PCH reset handshake. */
 	intel_pch_reset_handshake(dev_priv, !HAS_PCH_NOP(dev_priv));
 
-	/* 2-3. */
-	icl_combo_phys_init(dev_priv);
+	/* 2. Initialize all combo phys */
+	intel_combo_phy_init(dev_priv);
 
 	/*
-	 * 4. Enable Power Well 1 (PG1).
+	 * 3. Enable Power Well 1 (PG1).
 	 *    The AUX IO power wells will be enabled on demand.
 	 */
 	mutex_lock(&power_domains->lock);
@@ -3551,13 +4495,13 @@ void icl_display_core_init(struct drm_i915_private *dev_priv,
 	intel_power_well_enable(dev_priv, well);
 	mutex_unlock(&power_domains->lock);
 
-	/* 5. Enable CDCLK. */
-	icl_init_cdclk(dev_priv);
+	/* 4. Enable CDCLK. */
+	intel_cdclk_init(dev_priv);
 
-	/* 6. Enable DBUF. */
+	/* 5. Enable DBUF. */
 	icl_dbuf_enable(dev_priv);
 
-	/* 7. Setup MBUS. */
+	/* 6. Setup MBUS. */
 	icl_mbus_init(dev_priv);
 
 	if (resume && dev_priv->csr.dmc_payload)
@@ -3577,7 +4521,7 @@ void icl_display_core_uninit(struct drm_i915_private *dev_priv)
 	icl_dbuf_disable(dev_priv);
 
 	/* 3. Disable CD clock */
-	icl_uninit_cdclk(dev_priv);
+	intel_cdclk_uninit(dev_priv);
 
 	/*
 	 * 4. Disable Power Well 1 (PG1).
@@ -3590,7 +4534,7 @@ void icl_display_core_uninit(struct drm_i915_private *dev_priv)
 	mutex_unlock(&power_domains->lock);
 
 	/* 5. */
-	icl_combo_phys_uninit(dev_priv);
+	intel_combo_phy_uninit(dev_priv);
 }
 
 static void chv_phy_control_init(struct drm_i915_private *dev_priv)
@@ -3622,7 +4566,7 @@ static void chv_phy_control_init(struct drm_i915_private *dev_priv)
 	 * current lane status.
 	 */
 	if (cmn_bc->desc->ops->is_enabled(dev_priv, cmn_bc)) {
-		uint32_t status = I915_READ(DPLL(PIPE_A));
+		u32 status = I915_READ(DPLL(PIPE_A));
 		unsigned int mask;
 
 		mask = status & DPLL_PORTB_READY_MASK;
@@ -3653,7 +4597,7 @@ static void chv_phy_control_init(struct drm_i915_private *dev_priv)
 	}
 
 	if (cmn_d->desc->ops->is_enabled(dev_priv, cmn_d)) {
-		uint32_t status = I915_READ(DPIO_PHY_STATUS);
+		u32 status = I915_READ(DPIO_PHY_STATUS);
 		unsigned int mask;
 
 		mask = status & DPLL_PORTD_READY_MASK;
@@ -3708,11 +4652,41 @@ static void vlv_cmnlane_wa(struct drm_i915_private *dev_priv)
 	cmn->desc->ops->disable(dev_priv, cmn);
 }
 
+static bool vlv_punit_is_power_gated(struct drm_i915_private *dev_priv, u32 reg0)
+{
+	bool ret;
+
+	vlv_punit_get(dev_priv);
+	ret = (vlv_punit_read(dev_priv, reg0) & SSPM0_SSC_MASK) == SSPM0_SSC_PWR_GATE;
+	vlv_punit_put(dev_priv);
+
+	return ret;
+}
+
+static void assert_ved_power_gated(struct drm_i915_private *dev_priv)
+{
+	WARN(!vlv_punit_is_power_gated(dev_priv, PUNIT_REG_VEDSSPM0),
+	     "VED not power gated\n");
+}
+
+static void assert_isp_power_gated(struct drm_i915_private *dev_priv)
+{
+	static const struct pci_device_id isp_ids[] = {
+		{PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x0f38)},
+		{PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x22b8)},
+		{}
+	};
+
+	WARN(!pci_dev_present(isp_ids) &&
+	     !vlv_punit_is_power_gated(dev_priv, PUNIT_REG_ISPSSPM0),
+	     "ISP not power gated\n");
+}
+
 static void intel_power_domains_verify_state(struct drm_i915_private *dev_priv);
 
 /**
  * intel_power_domains_init_hw - initialize hardware power domain state
- * @dev_priv: i915 device instance
+ * @i915: i915 device instance
  * @resume: Called from resume code paths or not
  *
  * This function initializes the hardware power domain state and enables all
@@ -3726,30 +4700,37 @@ static void intel_power_domains_verify_state(struct drm_i915_private *dev_priv);
  * intel_power_domains_enable()) and must be paired with
  * intel_power_domains_fini_hw().
  */
-void intel_power_domains_init_hw(struct drm_i915_private *dev_priv, bool resume)
+void intel_power_domains_init_hw(struct drm_i915_private *i915, bool resume)
 {
-	struct i915_power_domains *power_domains = &dev_priv->power_domains;
+	struct i915_power_domains *power_domains = &i915->power_domains;
 
 	power_domains->initializing = true;
 
-	if (IS_ICELAKE(dev_priv)) {
-		icl_display_core_init(dev_priv, resume);
-	} else if (IS_CANNONLAKE(dev_priv)) {
-		cnl_display_core_init(dev_priv, resume);
-	} else if (IS_GEN9_BC(dev_priv)) {
-		skl_display_core_init(dev_priv, resume);
-	} else if (IS_GEN9_LP(dev_priv)) {
-		bxt_display_core_init(dev_priv, resume);
-	} else if (IS_CHERRYVIEW(dev_priv)) {
+	if (INTEL_GEN(i915) >= 11) {
+		icl_display_core_init(i915, resume);
+	} else if (IS_CANNONLAKE(i915)) {
+		cnl_display_core_init(i915, resume);
+	} else if (IS_GEN9_BC(i915)) {
+		skl_display_core_init(i915, resume);
+	} else if (IS_GEN9_LP(i915)) {
+		bxt_display_core_init(i915, resume);
+	} else if (IS_CHERRYVIEW(i915)) {
 		mutex_lock(&power_domains->lock);
-		chv_phy_control_init(dev_priv);
+		chv_phy_control_init(i915);
 		mutex_unlock(&power_domains->lock);
-	} else if (IS_VALLEYVIEW(dev_priv)) {
+		assert_isp_power_gated(i915);
+	} else if (IS_VALLEYVIEW(i915)) {
 		mutex_lock(&power_domains->lock);
-		vlv_cmnlane_wa(dev_priv);
+		vlv_cmnlane_wa(i915);
 		mutex_unlock(&power_domains->lock);
-	} else if (IS_IVYBRIDGE(dev_priv) || INTEL_GEN(dev_priv) >= 7)
-		intel_pch_reset_handshake(dev_priv, !HAS_PCH_NOP(dev_priv));
+		assert_ved_power_gated(i915);
+		assert_isp_power_gated(i915);
+	} else if (IS_BROADWELL(i915) || IS_HASWELL(i915)) {
+		hsw_assert_cdclk(i915);
+		intel_pch_reset_handshake(i915, !HAS_PCH_NOP(i915));
+	} else if (IS_IVYBRIDGE(i915)) {
+		intel_pch_reset_handshake(i915, !HAS_PCH_NOP(i915));
+	}
 
 	/*
 	 * Keep all power wells enabled for any dependent HW access during
@@ -3757,18 +4738,20 @@ void intel_power_domains_init_hw(struct drm_i915_private *dev_priv, bool resume)
 	 * resources powered until display HW readout is complete. We drop
 	 * this reference in intel_power_domains_enable().
 	 */
-	intel_display_power_get(dev_priv, POWER_DOMAIN_INIT);
+	power_domains->wakeref =
+		intel_display_power_get(i915, POWER_DOMAIN_INIT);
+
 	/* Disable power support if the user asked so. */
 	if (!i915_modparams.disable_power_well)
-		intel_display_power_get(dev_priv, POWER_DOMAIN_INIT);
-	intel_power_domains_sync_hw(dev_priv);
+		intel_display_power_get(i915, POWER_DOMAIN_INIT);
+	intel_power_domains_sync_hw(i915);
 
 	power_domains->initializing = false;
 }
 
 /**
  * intel_power_domains_fini_hw - deinitialize hw power domain state
- * @dev_priv: i915 device instance
+ * @i915: i915 device instance
  *
  * De-initializes the display power domain HW state. It also ensures that the
  * device stays powered up so that the driver can be reloaded.
@@ -3777,21 +4760,26 @@ void intel_power_domains_init_hw(struct drm_i915_private *dev_priv, bool resume)
  * intel_power_domains_disable()) and must be paired with
  * intel_power_domains_init_hw().
  */
-void intel_power_domains_fini_hw(struct drm_i915_private *dev_priv)
+void intel_power_domains_fini_hw(struct drm_i915_private *i915)
 {
-	/* Keep the power well enabled, but cancel its rpm wakeref. */
-	intel_runtime_pm_put(dev_priv);
+	intel_wakeref_t wakeref __maybe_unused =
+		fetch_and_zero(&i915->power_domains.wakeref);
 
 	/* Remove the refcount we took to keep power well support disabled. */
 	if (!i915_modparams.disable_power_well)
-		intel_display_power_put(dev_priv, POWER_DOMAIN_INIT);
+		intel_display_power_put_unchecked(i915, POWER_DOMAIN_INIT);
 
-	intel_power_domains_verify_state(dev_priv);
+	intel_display_power_flush_work_sync(i915);
+
+	intel_power_domains_verify_state(i915);
+
+	/* Keep the power well enabled, but cancel its rpm wakeref. */
+	intel_runtime_pm_put(i915, wakeref);
 }
 
 /**
  * intel_power_domains_enable - enable toggling of display power wells
- * @dev_priv: i915 device instance
+ * @i915: i915 device instance
  *
  * Enable the ondemand enabling/disabling of the display power wells. Note that
  * power wells not belonging to POWER_DOMAIN_INIT are allowed to be toggled
@@ -3801,30 +4789,36 @@ void intel_power_domains_fini_hw(struct drm_i915_private *dev_priv)
  * of display HW readout (which will acquire the power references reflecting
  * the current HW state).
  */
-void intel_power_domains_enable(struct drm_i915_private *dev_priv)
+void intel_power_domains_enable(struct drm_i915_private *i915)
 {
-	intel_display_power_put(dev_priv, POWER_DOMAIN_INIT);
+	intel_wakeref_t wakeref __maybe_unused =
+		fetch_and_zero(&i915->power_domains.wakeref);
 
-	intel_power_domains_verify_state(dev_priv);
+	intel_display_power_put(i915, POWER_DOMAIN_INIT, wakeref);
+	intel_power_domains_verify_state(i915);
 }
 
 /**
  * intel_power_domains_disable - disable toggling of display power wells
- * @dev_priv: i915 device instance
+ * @i915: i915 device instance
  *
  * Disable the ondemand enabling/disabling of the display power wells. See
  * intel_power_domains_enable() for which power wells this call controls.
  */
-void intel_power_domains_disable(struct drm_i915_private *dev_priv)
+void intel_power_domains_disable(struct drm_i915_private *i915)
 {
-	intel_display_power_get(dev_priv, POWER_DOMAIN_INIT);
+	struct i915_power_domains *power_domains = &i915->power_domains;
 
-	intel_power_domains_verify_state(dev_priv);
+	WARN_ON(power_domains->wakeref);
+	power_domains->wakeref =
+		intel_display_power_get(i915, POWER_DOMAIN_INIT);
+
+	intel_power_domains_verify_state(i915);
 }
 
 /**
  * intel_power_domains_suspend - suspend power domain state
- * @dev_priv: i915 device instance
+ * @i915: i915 device instance
  * @suspend_mode: specifies the target suspend state (idle, mem, hibernation)
  *
  * This function prepares the hardware power domain state before entering
@@ -3833,12 +4827,14 @@ void intel_power_domains_disable(struct drm_i915_private *dev_priv)
  * It must be called with power domains already disabled (after a call to
  * intel_power_domains_disable()) and paired with intel_power_domains_resume().
  */
-void intel_power_domains_suspend(struct drm_i915_private *dev_priv,
+void intel_power_domains_suspend(struct drm_i915_private *i915,
 				 enum i915_drm_suspend_mode suspend_mode)
 {
-	struct i915_power_domains *power_domains = &dev_priv->power_domains;
+	struct i915_power_domains *power_domains = &i915->power_domains;
+	intel_wakeref_t wakeref __maybe_unused =
+		fetch_and_zero(&power_domains->wakeref);
 
-	intel_display_power_put(dev_priv, POWER_DOMAIN_INIT);
+	intel_display_power_put(i915, POWER_DOMAIN_INIT, wakeref);
 
 	/*
 	 * In case of suspend-to-idle (aka S0ix) on a DMC platform without DC9
@@ -3847,10 +4843,11 @@ void intel_power_domains_suspend(struct drm_i915_private *dev_priv,
 	 * resources as required and also enable deeper system power states
 	 * that would be blocked if the firmware was inactive.
 	 */
-	if (!(dev_priv->csr.allowed_dc_mask & DC_STATE_EN_DC9) &&
+	if (!(i915->csr.allowed_dc_mask & DC_STATE_EN_DC9) &&
 	    suspend_mode == I915_DRM_SUSPEND_IDLE &&
-	    dev_priv->csr.dmc_payload != NULL) {
-		intel_power_domains_verify_state(dev_priv);
+	    i915->csr.dmc_payload) {
+		intel_display_power_flush_work(i915);
+		intel_power_domains_verify_state(i915);
 		return;
 	}
 
@@ -3858,26 +4855,27 @@ void intel_power_domains_suspend(struct drm_i915_private *dev_priv,
 	 * Even if power well support was disabled we still want to disable
 	 * power wells if power domains must be deinitialized for suspend.
 	 */
-	if (!i915_modparams.disable_power_well) {
-		intel_display_power_put(dev_priv, POWER_DOMAIN_INIT);
-		intel_power_domains_verify_state(dev_priv);
-	}
+	if (!i915_modparams.disable_power_well)
+		intel_display_power_put_unchecked(i915, POWER_DOMAIN_INIT);
 
-	if (IS_ICELAKE(dev_priv))
-		icl_display_core_uninit(dev_priv);
-	else if (IS_CANNONLAKE(dev_priv))
-		cnl_display_core_uninit(dev_priv);
-	else if (IS_GEN9_BC(dev_priv))
-		skl_display_core_uninit(dev_priv);
-	else if (IS_GEN9_LP(dev_priv))
-		bxt_display_core_uninit(dev_priv);
+	intel_display_power_flush_work(i915);
+	intel_power_domains_verify_state(i915);
+
+	if (INTEL_GEN(i915) >= 11)
+		icl_display_core_uninit(i915);
+	else if (IS_CANNONLAKE(i915))
+		cnl_display_core_uninit(i915);
+	else if (IS_GEN9_BC(i915))
+		skl_display_core_uninit(i915);
+	else if (IS_GEN9_LP(i915))
+		bxt_display_core_uninit(i915);
 
 	power_domains->display_core_suspended = true;
 }
 
 /**
  * intel_power_domains_resume - resume power domain state
- * @dev_priv: i915 device instance
+ * @i915: i915 device instance
  *
  * This function resume the hardware power domain state during system resume.
  *
@@ -3885,28 +4883,30 @@ void intel_power_domains_suspend(struct drm_i915_private *dev_priv,
  * intel_power_domains_enable()) and must be paired with
  * intel_power_domains_suspend().
  */
-void intel_power_domains_resume(struct drm_i915_private *dev_priv)
+void intel_power_domains_resume(struct drm_i915_private *i915)
 {
-	struct i915_power_domains *power_domains = &dev_priv->power_domains;
+	struct i915_power_domains *power_domains = &i915->power_domains;
 
 	if (power_domains->display_core_suspended) {
-		intel_power_domains_init_hw(dev_priv, true);
+		intel_power_domains_init_hw(i915, true);
 		power_domains->display_core_suspended = false;
 	} else {
-		intel_display_power_get(dev_priv, POWER_DOMAIN_INIT);
+		WARN_ON(power_domains->wakeref);
+		power_domains->wakeref =
+			intel_display_power_get(i915, POWER_DOMAIN_INIT);
 	}
 
-	intel_power_domains_verify_state(dev_priv);
+	intel_power_domains_verify_state(i915);
 }
 
 #if IS_ENABLED(CONFIG_DRM_I915_DEBUG_RUNTIME_PM)
 
-static void intel_power_domains_dump_info(struct drm_i915_private *dev_priv)
+static void intel_power_domains_dump_info(struct drm_i915_private *i915)
 {
-	struct i915_power_domains *power_domains = &dev_priv->power_domains;
+	struct i915_power_domains *power_domains = &i915->power_domains;
 	struct i915_power_well *power_well;
 
-	for_each_power_well(dev_priv, power_well) {
+	for_each_power_well(i915, power_well) {
 		enum intel_display_power_domain domain;
 
 		DRM_DEBUG_DRIVER("%-25s %d\n",
@@ -3921,7 +4921,7 @@ static void intel_power_domains_dump_info(struct drm_i915_private *dev_priv)
 
 /**
  * intel_power_domains_verify_state - verify the HW/SW state for all power wells
- * @dev_priv: i915 device instance
+ * @i915: i915 device instance
  *
  * Verify if the reference count of each power well matches its HW enabled
  * state and the total refcount of the domains it belongs to. This must be
@@ -3929,22 +4929,23 @@ static void intel_power_domains_dump_info(struct drm_i915_private *dev_priv)
  * acquiring reference counts for any power wells in use and disabling the
  * ones left on by BIOS but not required by any active output.
  */
-static void intel_power_domains_verify_state(struct drm_i915_private *dev_priv)
+static void intel_power_domains_verify_state(struct drm_i915_private *i915)
 {
-	struct i915_power_domains *power_domains = &dev_priv->power_domains;
+	struct i915_power_domains *power_domains = &i915->power_domains;
 	struct i915_power_well *power_well;
 	bool dump_domain_info;
 
 	mutex_lock(&power_domains->lock);
 
+	verify_async_put_domains_state(power_domains);
+
 	dump_domain_info = false;
-	for_each_power_well(dev_priv, power_well) {
+	for_each_power_well(i915, power_well) {
 		enum intel_display_power_domain domain;
 		int domains_count;
 		bool enabled;
 
-		enabled = power_well->desc->ops->is_enabled(dev_priv,
-							    power_well);
+		enabled = power_well->desc->ops->is_enabled(i915, power_well);
 		if ((power_well->count || power_well->desc->always_on) !=
 		    enabled)
 			DRM_ERROR("power well %s state mismatch (refcount %d/enabled %d)",
@@ -3968,7 +4969,7 @@ static void intel_power_domains_verify_state(struct drm_i915_private *dev_priv)
 		static bool dumped;
 
 		if (!dumped) {
-			intel_power_domains_dump_info(dev_priv);
+			intel_power_domains_dump_info(i915);
 			dumped = true;
 		}
 	}
@@ -3978,38 +4979,52 @@ static void intel_power_domains_verify_state(struct drm_i915_private *dev_priv)
 
 #else
 
-static void intel_power_domains_verify_state(struct drm_i915_private *dev_priv)
+static void intel_power_domains_verify_state(struct drm_i915_private *i915)
 {
 }
 
 #endif
 
-/**
- * intel_runtime_pm_get - grab a runtime pm reference
- * @dev_priv: i915 device instance
- *
- * This function grabs a device-level runtime pm reference (mostly used for GEM
- * code to ensure the GTT or GT is on) and ensures that it is powered up.
- *
- * Any runtime pm reference obtained by this function must have a symmetric
- * call to intel_runtime_pm_put() to release the reference again.
- */
-void intel_runtime_pm_get(struct drm_i915_private *dev_priv)
+static intel_wakeref_t __intel_runtime_pm_get(struct drm_i915_private *i915,
+					      bool wakelock)
 {
-	struct pci_dev *pdev = dev_priv->drm.pdev;
+	struct pci_dev *pdev = i915->drm.pdev;
 	struct device *kdev = &pdev->dev;
 	int ret;
 
 	ret = pm_runtime_get_sync(kdev);
 	WARN_ONCE(ret < 0, "pm_runtime_get_sync() failed: %d\n", ret);
 
-	atomic_inc(&dev_priv->runtime_pm.wakeref_count);
-	assert_rpm_wakelock_held(dev_priv);
+	intel_runtime_pm_acquire(i915, wakelock);
+
+	return track_intel_runtime_pm_wakeref(i915);
+}
+
+static intel_wakeref_t intel_runtime_pm_get_raw(struct drm_i915_private *i915)
+{
+	return __intel_runtime_pm_get(i915, false);
+}
+
+/**
+ * intel_runtime_pm_get - grab a runtime pm reference
+ * @i915: i915 device instance
+ *
+ * This function grabs a device-level runtime pm reference (mostly used for GEM
+ * code to ensure the GTT or GT is on) and ensures that it is powered up.
+ *
+ * Any runtime pm reference obtained by this function must have a symmetric
+ * call to intel_runtime_pm_put() to release the reference again.
+ *
+ * Returns: the wakeref cookie to pass to intel_runtime_pm_put()
+ */
+intel_wakeref_t intel_runtime_pm_get(struct drm_i915_private *i915)
+{
+	return __intel_runtime_pm_get(i915, true);
 }
 
 /**
  * intel_runtime_pm_get_if_in_use - grab a runtime pm reference if device in use
- * @dev_priv: i915 device instance
+ * @i915: i915 device instance
  *
  * This function grabs a device-level runtime pm reference if the device is
  * already in use and ensures that it is powered up. It is illegal to try
@@ -4018,12 +5033,13 @@ void intel_runtime_pm_get(struct drm_i915_private *dev_priv)
  * Any runtime pm reference obtained by this function must have a symmetric
  * call to intel_runtime_pm_put() to release the reference again.
  *
- * Returns: True if the wakeref was acquired, or False otherwise.
+ * Returns: the wakeref cookie to pass to intel_runtime_pm_put(), evaluates
+ * as True if the wakeref was acquired, or False otherwise.
  */
-bool intel_runtime_pm_get_if_in_use(struct drm_i915_private *dev_priv)
+intel_wakeref_t intel_runtime_pm_get_if_in_use(struct drm_i915_private *i915)
 {
 	if (IS_ENABLED(CONFIG_PM)) {
-		struct pci_dev *pdev = dev_priv->drm.pdev;
+		struct pci_dev *pdev = i915->drm.pdev;
 		struct device *kdev = &pdev->dev;
 
 		/*
@@ -4033,18 +5049,17 @@ bool intel_runtime_pm_get_if_in_use(struct drm_i915_private *dev_priv)
 		 * atm to the late/early system suspend/resume handlers.
 		 */
 		if (pm_runtime_get_if_in_use(kdev) <= 0)
-			return false;
+			return 0;
 	}
 
-	atomic_inc(&dev_priv->runtime_pm.wakeref_count);
-	assert_rpm_wakelock_held(dev_priv);
+	intel_runtime_pm_acquire(i915, true);
 
-	return true;
+	return track_intel_runtime_pm_wakeref(i915);
 }
 
 /**
  * intel_runtime_pm_get_noresume - grab a runtime pm reference
- * @dev_priv: i915 device instance
+ * @i915: i915 device instance
  *
  * This function grabs a device-level runtime pm reference (mostly used for GEM
  * code to ensure the GTT or GT is on).
@@ -4058,41 +5073,81 @@ bool intel_runtime_pm_get_if_in_use(struct drm_i915_private *dev_priv)
  *
  * Any runtime pm reference obtained by this function must have a symmetric
  * call to intel_runtime_pm_put() to release the reference again.
+ *
+ * Returns: the wakeref cookie to pass to intel_runtime_pm_put()
  */
-void intel_runtime_pm_get_noresume(struct drm_i915_private *dev_priv)
+intel_wakeref_t intel_runtime_pm_get_noresume(struct drm_i915_private *i915)
 {
-	struct pci_dev *pdev = dev_priv->drm.pdev;
+	struct pci_dev *pdev = i915->drm.pdev;
 	struct device *kdev = &pdev->dev;
 
-	assert_rpm_wakelock_held(dev_priv);
+	assert_rpm_wakelock_held(i915);
 	pm_runtime_get_noresume(kdev);
 
-	atomic_inc(&dev_priv->runtime_pm.wakeref_count);
+	intel_runtime_pm_acquire(i915, true);
+
+	return track_intel_runtime_pm_wakeref(i915);
 }
 
-/**
- * intel_runtime_pm_put - release a runtime pm reference
- * @dev_priv: i915 device instance
- *
- * This function drops the device-level runtime pm reference obtained by
- * intel_runtime_pm_get() and might power down the corresponding
- * hardware block right away if this is the last reference.
- */
-void intel_runtime_pm_put(struct drm_i915_private *dev_priv)
+static void __intel_runtime_pm_put(struct drm_i915_private *i915,
+				   intel_wakeref_t wref,
+				   bool wakelock)
 {
-	struct pci_dev *pdev = dev_priv->drm.pdev;
+	struct pci_dev *pdev = i915->drm.pdev;
 	struct device *kdev = &pdev->dev;
 
-	assert_rpm_wakelock_held(dev_priv);
-	atomic_dec(&dev_priv->runtime_pm.wakeref_count);
+	untrack_intel_runtime_pm_wakeref(i915, wref);
+
+	intel_runtime_pm_release(i915, wakelock);
 
 	pm_runtime_mark_last_busy(kdev);
 	pm_runtime_put_autosuspend(kdev);
 }
 
+#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_RUNTIME_PM)
+static void
+intel_runtime_pm_put_raw(struct drm_i915_private *i915, intel_wakeref_t wref)
+{
+	__intel_runtime_pm_put(i915, wref, false);
+}
+#endif
+
+/**
+ * intel_runtime_pm_put_unchecked - release an unchecked runtime pm reference
+ * @i915: i915 device instance
+ *
+ * This function drops the device-level runtime pm reference obtained by
+ * intel_runtime_pm_get() and might power down the corresponding
+ * hardware block right away if this is the last reference.
+ *
+ * This function exists only for historical reasons and should be avoided in
+ * new code, as the correctness of its use cannot be checked. Always use
+ * intel_runtime_pm_put() instead.
+ */
+void intel_runtime_pm_put_unchecked(struct drm_i915_private *i915)
+{
+	__intel_runtime_pm_put(i915, -1, true);
+}
+
+#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_RUNTIME_PM)
+/**
+ * intel_runtime_pm_put - release a runtime pm reference
+ * @i915: i915 device instance
+ * @wref: wakeref acquired for the reference that is being released
+ *
+ * This function drops the device-level runtime pm reference obtained by
+ * intel_runtime_pm_get() and might power down the corresponding
+ * hardware block right away if this is the last reference.
+ */
+void intel_runtime_pm_put(struct drm_i915_private *i915, intel_wakeref_t wref)
+{
+	__intel_runtime_pm_put(i915, wref, true);
+}
+#endif
+
 /**
  * intel_runtime_pm_enable - enable runtime pm
- * @dev_priv: i915 device instance
+ * @i915: i915 device instance
  *
  * This function enables runtime pm at the end of the driver load sequence.
  *
@@ -4100,9 +5155,9 @@ void intel_runtime_pm_put(struct drm_i915_private *dev_priv)
  * subordinate display power domains. That is done by
  * intel_power_domains_enable().
  */
-void intel_runtime_pm_enable(struct drm_i915_private *dev_priv)
+void intel_runtime_pm_enable(struct drm_i915_private *i915)
 {
-	struct pci_dev *pdev = dev_priv->drm.pdev;
+	struct pci_dev *pdev = i915->drm.pdev;
 	struct device *kdev = &pdev->dev;
 
 	/*
@@ -4124,7 +5179,7 @@ void intel_runtime_pm_enable(struct drm_i915_private *dev_priv)
 	 * so the driver's own RPM reference tracking asserts also work on
 	 * platforms without RPM support.
 	 */
-	if (!HAS_RUNTIME_PM(dev_priv)) {
+	if (!HAS_RUNTIME_PM(i915)) {
 		int ret;
 
 		pm_runtime_dont_use_autosuspend(kdev);
@@ -4142,17 +5197,35 @@ void intel_runtime_pm_enable(struct drm_i915_private *dev_priv)
 	pm_runtime_put_autosuspend(kdev);
 }
 
-void intel_runtime_pm_disable(struct drm_i915_private *dev_priv)
+void intel_runtime_pm_disable(struct drm_i915_private *i915)
 {
-	struct pci_dev *pdev = dev_priv->drm.pdev;
+	struct pci_dev *pdev = i915->drm.pdev;
 	struct device *kdev = &pdev->dev;
 
 	/* Transfer rpm ownership back to core */
-	WARN(pm_runtime_get_sync(&dev_priv->drm.pdev->dev) < 0,
+	WARN(pm_runtime_get_sync(kdev) < 0,
 	     "Failed to pass rpm ownership back to core\n");
 
 	pm_runtime_dont_use_autosuspend(kdev);
 
-	if (!HAS_RUNTIME_PM(dev_priv))
+	if (!HAS_RUNTIME_PM(i915))
 		pm_runtime_put(kdev);
+}
+
+void intel_runtime_pm_cleanup(struct drm_i915_private *i915)
+{
+	struct i915_runtime_pm *rpm = &i915->runtime_pm;
+	int count = atomic_read(&rpm->wakeref_count);
+
+	WARN(count,
+	     "i915 raw-wakerefs=%d wakelocks=%d on cleanup\n",
+	     intel_rpm_raw_wakeref_count(count),
+	     intel_rpm_wakelock_count(count));
+
+	untrack_all_intel_runtime_pm_wakerefs(i915);
+}
+
+void intel_runtime_pm_init_early(struct drm_i915_private *i915)
+{
+	init_intel_runtime_pm_wakeref(i915);
 }

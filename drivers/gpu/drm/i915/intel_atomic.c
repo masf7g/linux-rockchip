@@ -29,11 +29,15 @@
  * See intel_atomic_plane.c for the plane-specific atomic functionality.
  */
 
-#include <drm/drmP.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_fourcc.h>
 #include <drm/drm_plane_helper.h>
+
+#include "intel_atomic.h"
 #include "intel_drv.h"
+#include "intel_hdcp.h"
+#include "intel_sprite.h"
 
 /**
  * intel_digital_connector_atomic_get_property - hook for connector->atomic_get_property.
@@ -47,7 +51,7 @@
 int intel_digital_connector_atomic_get_property(struct drm_connector *connector,
 						const struct drm_connector_state *state,
 						struct drm_property *property,
-						uint64_t *val)
+						u64 *val)
 {
 	struct drm_device *dev = connector->dev;
 	struct drm_i915_private *dev_priv = to_i915(dev);
@@ -79,7 +83,7 @@ int intel_digital_connector_atomic_get_property(struct drm_connector *connector,
 int intel_digital_connector_atomic_set_property(struct drm_connector *connector,
 						struct drm_connector_state *state,
 						struct drm_property *property,
-						uint64_t val)
+						u64 val)
 {
 	struct drm_device *dev = connector->dev;
 	struct drm_i915_private *dev_priv = to_i915(dev);
@@ -102,12 +106,14 @@ int intel_digital_connector_atomic_set_property(struct drm_connector *connector,
 }
 
 int intel_digital_connector_atomic_check(struct drm_connector *conn,
-					 struct drm_connector_state *new_state)
+					 struct drm_atomic_state *state)
 {
+	struct drm_connector_state *new_state =
+		drm_atomic_get_new_connector_state(state, conn);
 	struct intel_digital_connector_state *new_conn_state =
 		to_intel_digital_connector_state(new_state);
 	struct drm_connector_state *old_state =
-		drm_atomic_get_old_connector_state(new_state->state, conn);
+		drm_atomic_get_old_connector_state(state, conn);
 	struct intel_digital_connector_state *old_conn_state =
 		to_intel_digital_connector_state(old_state);
 	struct drm_crtc_state *crtc_state;
@@ -117,7 +123,7 @@ int intel_digital_connector_atomic_check(struct drm_connector *conn,
 	if (!new_state->crtc)
 		return 0;
 
-	crtc_state = drm_atomic_get_new_crtc_state(new_state->state, new_state->crtc);
+	crtc_state = drm_atomic_get_new_crtc_state(state, new_state->crtc);
 
 	/*
 	 * These properties are handled by fastset, and might not end
@@ -125,6 +131,7 @@ int intel_digital_connector_atomic_check(struct drm_connector *conn,
 	 */
 	if (new_conn_state->force_audio != old_conn_state->force_audio ||
 	    new_conn_state->broadcast_rgb != old_conn_state->broadcast_rgb ||
+	    new_conn_state->base.colorspace != old_conn_state->base.colorspace ||
 	    new_conn_state->base.picture_aspect_ratio != old_conn_state->base.picture_aspect_ratio ||
 	    new_conn_state->base.content_type != old_conn_state->base.content_type ||
 	    new_conn_state->base.scaling_mode != old_conn_state->base.scaling_mode)
@@ -233,10 +240,11 @@ static void intel_atomic_setup_scaler(struct intel_crtc_scaler_state *scaler_sta
 	if (plane_state && plane_state->base.fb &&
 	    plane_state->base.fb->format->is_yuv &&
 	    plane_state->base.fb->format->num_planes > 1) {
-		if (IS_GEN9(dev_priv) &&
+		struct intel_plane *plane = to_intel_plane(plane_state->base.plane);
+		if (IS_GEN(dev_priv, 9) &&
 		    !IS_GEMINILAKE(dev_priv)) {
 			mode = SKL_PS_SCALER_MODE_NV12;
-		} else if (icl_is_hdr_plane(to_intel_plane(plane_state->base.plane))) {
+		} else if (icl_is_hdr_plane(dev_priv, plane->id)) {
 			/*
 			 * On gen11+'s HDR planes we only use the scaler for
 			 * scaling. They have a dedicated chroma upsampler, so
@@ -405,4 +413,16 @@ void intel_atomic_state_clear(struct drm_atomic_state *s)
 	struct intel_atomic_state *state = to_intel_atomic_state(s);
 	drm_atomic_state_default_clear(&state->base);
 	state->dpll_set = state->modeset = false;
+}
+
+struct intel_crtc_state *
+intel_atomic_get_crtc_state(struct drm_atomic_state *state,
+			    struct intel_crtc *crtc)
+{
+	struct drm_crtc_state *crtc_state;
+	crtc_state = drm_atomic_get_crtc_state(state, &crtc->base);
+	if (IS_ERR(crtc_state))
+		return ERR_CAST(crtc_state);
+
+	return to_intel_crtc_state(crtc_state);
 }

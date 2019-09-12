@@ -38,6 +38,7 @@
 #include <linux/mm.h>
 #include <linux/pagevec.h>
 
+#include "gt/intel_reset.h"
 #include "i915_request.h"
 #include "i915_selftest.h"
 #include "i915_timeline.h"
@@ -162,11 +163,18 @@ typedef u64 gen8_ppgtt_pml4e_t;
 
 struct sg_table;
 
+struct intel_remapped_plane_info {
+	/* in gtt pages */
+	unsigned int width, height, stride, offset;
+} __packed;
+
+struct intel_remapped_info {
+	struct intel_remapped_plane_info plane[2];
+	unsigned int unused_mbz;
+} __packed;
+
 struct intel_rotation_info {
-	struct intel_rotation_plane_info {
-		/* tiles */
-		unsigned int width, height, stride, offset;
-	} plane[2];
+	struct intel_remapped_plane_info plane[2];
 } __packed;
 
 struct intel_partial_info {
@@ -178,12 +186,20 @@ enum i915_ggtt_view_type {
 	I915_GGTT_VIEW_NORMAL = 0,
 	I915_GGTT_VIEW_ROTATED = sizeof(struct intel_rotation_info),
 	I915_GGTT_VIEW_PARTIAL = sizeof(struct intel_partial_info),
+	I915_GGTT_VIEW_REMAPPED = sizeof(struct intel_remapped_info),
 };
 
 static inline void assert_i915_gem_gtt_types(void)
 {
 	BUILD_BUG_ON(sizeof(struct intel_rotation_info) != 8*sizeof(unsigned int));
 	BUILD_BUG_ON(sizeof(struct intel_partial_info) != sizeof(u64) + sizeof(unsigned int));
+	BUILD_BUG_ON(sizeof(struct intel_remapped_info) != 9*sizeof(unsigned int));
+
+	/* Check that rotation/remapped shares offsets for simplicity */
+	BUILD_BUG_ON(offsetof(struct intel_remapped_info, plane[0]) !=
+		     offsetof(struct intel_rotation_info, plane[0]));
+	BUILD_BUG_ON(offsetofend(struct intel_remapped_info, plane[1]) !=
+		     offsetofend(struct intel_rotation_info, plane[1]));
 
 	/* As we encode the size of each branch inside the union into its type,
 	 * we have to be careful that each branch has a unique size.
@@ -192,6 +208,7 @@ static inline void assert_i915_gem_gtt_types(void)
 	case I915_GGTT_VIEW_NORMAL:
 	case I915_GGTT_VIEW_PARTIAL:
 	case I915_GGTT_VIEW_ROTATED:
+	case I915_GGTT_VIEW_REMAPPED:
 		/* gcc complains if these are identical cases */
 		break;
 	}
@@ -203,6 +220,7 @@ struct i915_ggtt_view {
 		/* Members need to contain no holes/padding */
 		struct intel_partial_info partial;
 		struct intel_rotation_info rotated;
+		struct intel_remapped_info remapped;
 	};
 };
 
@@ -212,7 +230,6 @@ struct i915_vma;
 
 struct i915_page_dma {
 	struct page *page;
-	int order;
 	union {
 		dma_addr_t daddr;
 
@@ -288,40 +305,23 @@ struct i915_address_space {
 	bool closed;
 
 	struct mutex mutex; /* protects vma and our lists */
+#define VM_CLASS_GGTT 0
+#define VM_CLASS_PPGTT 1
 
 	u64 scratch_pte;
+	int scratch_order;
 	struct i915_page_dma scratch_page;
 	struct i915_page_table *scratch_pt;
 	struct i915_page_directory *scratch_pd;
 	struct i915_page_directory_pointer *scratch_pdp; /* GEN8+ & 48b PPGTT */
 
 	/**
-	 * List of objects currently involved in rendering.
-	 *
-	 * Includes buffers having the contents of their GPU caches
-	 * flushed, not necessarily primitives. last_read_req
-	 * represents when the rendering involved will be completed.
-	 *
-	 * A reference is held on the buffer while on this list.
+	 * List of vma currently bound.
 	 */
-	struct list_head active_list;
+	struct list_head bound_list;
 
 	/**
-	 * LRU list of objects which are not in the ringbuffer and
-	 * are ready to unbind, but are still in the GTT.
-	 *
-	 * last_read_req is NULL while an object is in this list.
-	 *
-	 * A reference is not held on the buffer while on this list,
-	 * as merely being GTT-bound shouldn't prevent its being
-	 * freed, and we'll pull it off the list in the free path.
-	 */
-	struct list_head inactive_list;
-
-	/**
-	 * List of vma that have been unbound.
-	 *
-	 * A reference is not held on the buffer while on this list.
+	 * List of vma that are not unbound.
 	 */
 	struct list_head unbound_list;
 
@@ -365,7 +365,7 @@ struct i915_address_space {
 #define i915_is_ggtt(vm) ((vm)->is_ggtt)
 
 static inline bool
-i915_vm_is_48bit(const struct i915_address_space *vm)
+i915_vm_is_4lvl(const struct i915_address_space *vm)
 {
 	return (vm->total - 1) >> 32;
 }
@@ -373,7 +373,7 @@ i915_vm_is_48bit(const struct i915_address_space *vm)
 static inline bool
 i915_vm_has_scratch_64K(struct i915_address_space *vm)
 {
-	return vm->scratch_page.order == get_order(I915_GTT_PAGE_SIZE_64K);
+	return vm->scratch_order == get_order(I915_GTT_PAGE_SIZE_64K);
 }
 
 /* The Graphics Translation Table is the way in which GEN hardware translates a
@@ -401,20 +401,19 @@ struct i915_ggtt {
 	u32 pin_bias;
 
 	struct drm_mm_node error_capture;
+	struct drm_mm_node uc_fw;
 };
 
 struct i915_hw_ppgtt {
 	struct i915_address_space vm;
 	struct kref ref;
 
-	unsigned long pd_dirty_rings;
+	intel_engine_mask_t pd_dirty_engines;
 	union {
 		struct i915_pml4 pml4;		/* GEN8+ & 48b PPGTT */
 		struct i915_page_directory_pointer pdp;	/* GEN8+ */
 		struct i915_page_directory pd;		/* GEN6-7 */
 	};
-
-	void (*debug_dump)(struct i915_hw_ppgtt *ppgtt, struct seq_file *m);
 };
 
 struct gen6_hw_ppgtt {
@@ -425,6 +424,8 @@ struct gen6_hw_ppgtt {
 
 	unsigned int pin_count;
 	bool scan_for_unused_pt;
+
+	struct gen6_ppgtt_cleanup_work *work;
 };
 
 #define __to_gen6_ppgtt(base) container_of(base, struct gen6_hw_ppgtt, base)
@@ -507,7 +508,7 @@ static inline u32 gen6_pde_index(u32 addr)
 static inline unsigned int
 i915_pdpes_per_pdp(const struct i915_address_space *vm)
 {
-	if (i915_vm_is_48bit(vm))
+	if (i915_vm_is_4lvl(vm))
 		return GEN8_PML4ES_PER_PML4;
 
 	return GEN8_3LVL_PDPES;
@@ -622,15 +623,16 @@ int i915_gem_init_ggtt(struct drm_i915_private *dev_priv);
 void i915_ggtt_cleanup_hw(struct drm_i915_private *dev_priv);
 
 int i915_ppgtt_init_hw(struct drm_i915_private *dev_priv);
+
+struct i915_hw_ppgtt *i915_ppgtt_create(struct drm_i915_private *dev_priv);
 void i915_ppgtt_release(struct kref *kref);
-struct i915_hw_ppgtt *i915_ppgtt_create(struct drm_i915_private *dev_priv,
-					struct drm_i915_file_private *fpriv);
-void i915_ppgtt_close(struct i915_address_space *vm);
-static inline void i915_ppgtt_get(struct i915_hw_ppgtt *ppgtt)
+
+static inline struct i915_hw_ppgtt *i915_ppgtt_get(struct i915_hw_ppgtt *ppgtt)
 {
-	if (ppgtt)
-		kref_get(&ppgtt->ref);
+	kref_get(&ppgtt->ref);
+	return ppgtt;
 }
+
 static inline void i915_ppgtt_put(struct i915_hw_ppgtt *ppgtt)
 {
 	if (ppgtt)
@@ -639,6 +641,7 @@ static inline void i915_ppgtt_put(struct i915_hw_ppgtt *ppgtt)
 
 int gen6_ppgtt_pin(struct i915_hw_ppgtt *base);
 void gen6_ppgtt_unpin(struct i915_hw_ppgtt *base);
+void gen6_ppgtt_unpin_all(struct i915_hw_ppgtt *base);
 
 void i915_check_and_clear_faults(struct drm_i915_private *dev_priv);
 void i915_gem_suspend_gtt_mappings(struct drm_i915_private *dev_priv);
@@ -661,19 +664,19 @@ int i915_gem_gtt_insert(struct i915_address_space *vm,
 
 /* Flags used by pin/bind&friends. */
 #define PIN_NONBLOCK		BIT_ULL(0)
-#define PIN_MAPPABLE		BIT_ULL(1)
-#define PIN_ZONE_4G		BIT_ULL(2)
-#define PIN_NONFAULT		BIT_ULL(3)
-#define PIN_NOEVICT		BIT_ULL(4)
+#define PIN_NONFAULT		BIT_ULL(1)
+#define PIN_NOEVICT		BIT_ULL(2)
+#define PIN_MAPPABLE		BIT_ULL(3)
+#define PIN_ZONE_4G		BIT_ULL(4)
+#define PIN_HIGH		BIT_ULL(5)
+#define PIN_OFFSET_BIAS		BIT_ULL(6)
+#define PIN_OFFSET_FIXED	BIT_ULL(7)
 
-#define PIN_MBZ			BIT_ULL(5) /* I915_VMA_PIN_OVERFLOW */
-#define PIN_GLOBAL		BIT_ULL(6) /* I915_VMA_GLOBAL_BIND */
-#define PIN_USER		BIT_ULL(7) /* I915_VMA_LOCAL_BIND */
-#define PIN_UPDATE		BIT_ULL(8)
+#define PIN_MBZ			BIT_ULL(8) /* I915_VMA_PIN_OVERFLOW */
+#define PIN_GLOBAL		BIT_ULL(9) /* I915_VMA_GLOBAL_BIND */
+#define PIN_USER		BIT_ULL(10) /* I915_VMA_LOCAL_BIND */
+#define PIN_UPDATE		BIT_ULL(11)
 
-#define PIN_HIGH		BIT_ULL(9)
-#define PIN_OFFSET_BIAS		BIT_ULL(10)
-#define PIN_OFFSET_FIXED	BIT_ULL(11)
 #define PIN_OFFSET_MASK		(-I915_GTT_PAGE_SIZE)
 
 #endif

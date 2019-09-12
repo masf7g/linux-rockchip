@@ -33,11 +33,14 @@
 #include <linux/list.h>
 #include <linux/list_sort.h>
 #include <linux/export.h>
-#include <drm/drmP.h>
-#include <drm/drm_crtc.h>
+
 #include <video/of_videomode.h>
 #include <video/videomode.h>
+
+#include <drm/drm_crtc.h>
+#include <drm/drm_device.h>
 #include <drm/drm_modes.h>
+#include <drm/drm_print.h>
 
 #include "drm_crtc_internal.h"
 
@@ -655,22 +658,22 @@ EXPORT_SYMBOL_GPL(drm_display_mode_to_videomode);
  * @bus_flags: information about pixelclk, sync and DE polarity will be stored
  * here
  *
- * Sets DRM_BUS_FLAG_DE_(LOW|HIGH),  DRM_BUS_FLAG_PIXDATA_(POS|NEG)EDGE and
- * DISPLAY_FLAGS_SYNC_(POS|NEG)EDGE in @bus_flags according to DISPLAY_FLAGS
+ * Sets DRM_BUS_FLAG_DE_(LOW|HIGH),  DRM_BUS_FLAG_PIXDATA_DRIVE_(POS|NEG)EDGE
+ * and DISPLAY_FLAGS_SYNC_(POS|NEG)EDGE in @bus_flags according to DISPLAY_FLAGS
  * found in @vm
  */
 void drm_bus_flags_from_videomode(const struct videomode *vm, u32 *bus_flags)
 {
 	*bus_flags = 0;
 	if (vm->flags & DISPLAY_FLAGS_PIXDATA_POSEDGE)
-		*bus_flags |= DRM_BUS_FLAG_PIXDATA_POSEDGE;
+		*bus_flags |= DRM_BUS_FLAG_PIXDATA_DRIVE_POSEDGE;
 	if (vm->flags & DISPLAY_FLAGS_PIXDATA_NEGEDGE)
-		*bus_flags |= DRM_BUS_FLAG_PIXDATA_NEGEDGE;
+		*bus_flags |= DRM_BUS_FLAG_PIXDATA_DRIVE_NEGEDGE;
 
 	if (vm->flags & DISPLAY_FLAGS_SYNC_POSEDGE)
-		*bus_flags |= DRM_BUS_FLAG_SYNC_POSEDGE;
+		*bus_flags |= DRM_BUS_FLAG_SYNC_DRIVE_POSEDGE;
 	if (vm->flags & DISPLAY_FLAGS_SYNC_NEGEDGE)
-		*bus_flags |= DRM_BUS_FLAG_SYNC_NEGEDGE;
+		*bus_flags |= DRM_BUS_FLAG_SYNC_DRIVE_NEGEDGE;
 
 	if (vm->flags & DISPLAY_FLAGS_DE_LOW)
 		*bus_flags |= DRM_BUS_FLAG_DE_LOW;
@@ -751,7 +754,7 @@ int drm_mode_hsync(const struct drm_display_mode *mode)
 	if (mode->hsync)
 		return mode->hsync;
 
-	if (mode->htotal < 0)
+	if (mode->htotal <= 0)
 		return 0;
 
 	calc_val = (mode->clock * 1000) / mode->htotal; /* hsync in Hz */
@@ -1272,7 +1275,7 @@ const char *drm_get_mode_status_name(enum drm_mode_status status)
  * @verbose: be verbose about it
  *
  * This helper function can be used to prune a display mode list after
- * validation has been completed. All modes who's status is not MODE_OK will be
+ * validation has been completed. All modes whose status is not MODE_OK will be
  * removed from the list, and if @verbose the status code and mode name is also
  * printed to dmesg.
  */
