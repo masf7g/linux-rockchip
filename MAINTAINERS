@@ -834,17 +834,11 @@ F:	drivers/iommu/amd_iommu*.[ch]
 F:	include/linux/amd-iommu.h
 
 AMD KFD
-M:	Oded Gabbay <oded.gabbay@gmail.com>
-L:	dri-devel@lists.freedesktop.org
-T:	git git://people.freedesktop.org/~gabbayo/linux.git
+M:	Felix Kuehling <Felix.Kuehling@amd.com>
+L:	amd-gfx@lists.freedesktop.org
+T:	git git://people.freedesktop.org/~agd5f/linux
 S:	Supported
-F:	drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c
-F:	drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
-F:	drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v7.c
-F:	drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
-F:	drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v9.c
-F:	drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_fence.c
-F:	drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+F:	drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd*.[ch]
 F:	drivers/gpu/drm/amd/amdkfd/
 F:	drivers/gpu/drm/amd/include/cik_structs.h
 F:	drivers/gpu/drm/amd/include/kgd_kfd_interface.h
@@ -1402,7 +1396,7 @@ F:	drivers/pinctrl/actions/*
 F:	drivers/soc/actions/
 F:	include/dt-bindings/power/owl-*
 F:	include/linux/soc/actions/
-F:	Documentation/devicetree/bindings/arm/actions.txt
+F:	Documentation/devicetree/bindings/arm/actions.yaml
 F:	Documentation/devicetree/bindings/clock/actions,owl-cmu.txt
 F:	Documentation/devicetree/bindings/dma/owl-dma.txt
 F:	Documentation/devicetree/bindings/i2c/i2c-owl.txt
@@ -2168,7 +2162,7 @@ M:	Andreas Färber <afaerber@suse.de>
 L:	linux-arm-kernel@lists.infradead.org (moderated for non-subscribers)
 S:	Maintained
 F:	arch/arm64/boot/dts/realtek/
-F:	Documentation/devicetree/bindings/arm/realtek.txt
+F:	Documentation/devicetree/bindings/arm/realtek.yaml
 
 ARM/RENESAS ARM64 ARCHITECTURE
 M:	Simon Horman <horms@verge.net.au>
@@ -12757,6 +12751,12 @@ L:	linux-input@vger.kernel.org
 S:	Maintained
 F:	Documentation/input/devices/pxrc.rst
 F:	drivers/input/joystick/pxrc.c
+
+FLYSKY FSIA6B RC RECEIVER
+M:	Markus Koch <markus@notsyncing.net>
+L:	linux-input@vger.kernel.org
+S:	Maintained
+F:	drivers/input/joystick/fsia6b.c
 
 PHONET PROTOCOL
 M:	Remi Denis-Courmont <courmisch@gmail.com>
