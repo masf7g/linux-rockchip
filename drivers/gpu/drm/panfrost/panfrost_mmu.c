@@ -156,6 +156,9 @@ int panfrost_mmu_map(struct panfrost_gem_object *bo)
 	struct sg_table *sgt;
 	int ret;
 
+	if (WARN_ON(bo->is_mapped))
+		return 0;
+
 	sgt = drm_gem_shmem_get_pages_sgt(obj);
 	if (WARN_ON(IS_ERR(sgt)))
 		return PTR_ERR(sgt);
@@ -189,6 +192,7 @@ int panfrost_mmu_map(struct panfrost_gem_object *bo)
 
 	pm_runtime_mark_last_busy(pfdev->dev);
 	pm_runtime_put_autosuspend(pfdev->dev);
+	bo->is_mapped = true;
 
 	return 0;
 }
@@ -203,6 +207,9 @@ void panfrost_mmu_unmap(struct panfrost_gem_object *bo)
 	size_t unmapped_len = 0;
 	int ret;
 
+	if (WARN_ON(!bo->is_mapped))
+		return;
+
 	dev_dbg(pfdev->dev, "unmap: iova=%llx, len=%zx", iova, len);
 
 	ret = pm_runtime_get_sync(pfdev->dev);
@@ -215,7 +222,7 @@ void panfrost_mmu_unmap(struct panfrost_gem_object *bo)
 		size_t unmapped_page;
 		size_t pgsize = get_pgsize(iova, len - unmapped_len);
 
-		unmapped_page = ops->unmap(ops, iova, pgsize);
+		unmapped_page = ops->unmap(ops, iova, pgsize, NULL);
 		if (!unmapped_page)
 			break;
 
@@ -230,6 +237,7 @@ void panfrost_mmu_unmap(struct panfrost_gem_object *bo)
 
 	pm_runtime_mark_last_busy(pfdev->dev);
 	pm_runtime_put_autosuspend(pfdev->dev);
+	bo->is_mapped = false;
 }
 
 static void mmu_tlb_inv_context_s1(void *cookie)
@@ -239,20 +247,28 @@ static void mmu_tlb_inv_context_s1(void *cookie)
 	mmu_hw_do_operation(pfdev, 0, 0, ~0UL, AS_COMMAND_FLUSH_MEM);
 }
 
-static void mmu_tlb_inv_range_nosync(unsigned long iova, size_t size,
-				     size_t granule, bool leaf, void *cookie)
-{}
-
 static void mmu_tlb_sync_context(void *cookie)
 {
 	//struct panfrost_device *pfdev = cookie;
 	// TODO: Wait 1000 GPU cycles for HW_ISSUE_6367/T60X
 }
 
-static const struct iommu_gather_ops mmu_tlb_ops = {
+static void mmu_tlb_flush_walk(unsigned long iova, size_t size, size_t granule,
+			       void *cookie)
+{
+	mmu_tlb_sync_context(cookie);
+}
+
+static void mmu_tlb_flush_leaf(unsigned long iova, size_t size, size_t granule,
+			       void *cookie)
+{
+	mmu_tlb_sync_context(cookie);
+}
+
+static const struct iommu_flush_ops mmu_tlb_ops = {
 	.tlb_flush_all	= mmu_tlb_inv_context_s1,
-	.tlb_add_flush	= mmu_tlb_inv_range_nosync,
-	.tlb_sync	= mmu_tlb_sync_context,
+	.tlb_flush_walk = mmu_tlb_flush_walk,
+	.tlb_flush_leaf = mmu_tlb_flush_leaf,
 };
 
 static const char *access_type_name(struct panfrost_device *pfdev,
