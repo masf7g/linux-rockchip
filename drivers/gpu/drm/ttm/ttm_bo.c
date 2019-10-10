@@ -675,7 +675,7 @@ static void ttm_bo_release(struct kref *kref)
 	if (bo->bdev->driver->release_notify)
 		bo->bdev->driver->release_notify(bo);
 
-	drm_vma_offset_remove(&bdev->vma_manager, &bo->base.vma_node);
+	drm_vma_offset_remove(bdev->vma_manager, &bo->base.vma_node);
 	ttm_mem_io_lock(man, false);
 	ttm_mem_io_free_vm(bo);
 	ttm_mem_io_unlock(man);

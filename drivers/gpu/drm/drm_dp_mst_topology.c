@@ -32,7 +32,6 @@
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_dp_mst_helper.h>
 #include <drm/drm_drv.h>
-#include <drm/drm_fixed.h>
 #include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 
@@ -1123,11 +1122,11 @@ static void drm_dp_mst_put_payload_id(struct drm_dp_mst_topology_mgr *mgr,
 	clear_bit(vcpi - 1, &mgr->vcpi_mask);
 
 	for (i = 0; i < mgr->max_payloads; i++) {
-		if (mgr->proposed_vcpis[i])
-			if (mgr->proposed_vcpis[i]->vcpi == vcpi) {
-				mgr->proposed_vcpis[i] = NULL;
-				clear_bit(i + 1, &mgr->payload_mask);
-			}
+		if (mgr->proposed_vcpis[i] &&
+		    mgr->proposed_vcpis[i]->vcpi == vcpi) {
+			mgr->proposed_vcpis[i] = NULL;
+			clear_bit(i + 1, &mgr->payload_mask);
+		}
 	}
 	mutex_unlock(&mgr->payload_lock);
 }
@@ -1180,7 +1179,7 @@ static int drm_dp_mst_wait_tx_reply(struct drm_dp_mst_branch *mstb,
 		}
 	}
 out:
-	if (unlikely(ret == -EIO && drm_debug & DRM_UT_DP)) {
+	if (unlikely(ret == -EIO) && drm_debug_enabled(DRM_UT_DP)) {
 		struct drm_printer p = drm_debug_printer(DBG_PREFIX);
 
 		drm_dp_mst_dump_sideband_msg_tx(&p, txmsg);
@@ -2323,7 +2322,7 @@ static int process_single_tx_qlock(struct drm_dp_mst_topology_mgr *mgr,
 	idx += tosend + 1;
 
 	ret = drm_dp_send_sideband_msg(mgr, up, chunk, idx);
-	if (unlikely(ret && drm_debug & DRM_UT_DP)) {
+	if (unlikely(ret) && drm_debug_enabled(DRM_UT_DP)) {
 		struct drm_printer p = drm_debug_printer(DBG_PREFIX);
 
 		drm_printf(&p, "sideband msg failed to send\n");
@@ -2390,7 +2389,7 @@ static void drm_dp_queue_down_tx(struct drm_dp_mst_topology_mgr *mgr,
 	mutex_lock(&mgr->qlock);
 	list_add_tail(&txmsg->next, &mgr->tx_msg_downq);
 
-	if (unlikely(drm_debug & DRM_UT_DP)) {
+	if (drm_debug_enabled(DRM_UT_DP)) {
 		struct drm_printer p = drm_debug_printer(DBG_PREFIX);
 
 		drm_dp_mst_dump_sideband_msg_tx(&p, txmsg);
@@ -2977,30 +2976,13 @@ static int drm_dp_send_up_ack_reply(struct drm_dp_mst_topology_mgr *mgr,
 	return 0;
 }
 
-static bool drm_dp_get_vc_payload_bw(int dp_link_bw,
-				     int dp_link_count,
-				     int *out)
+static int drm_dp_get_vc_payload_bw(u8 dp_link_bw, u8  dp_link_count)
 {
-	switch (dp_link_bw) {
-	default:
+	if (dp_link_bw == 0 || dp_link_count == 0)
 		DRM_DEBUG_KMS("invalid link bandwidth in DPCD: %x (link count: %d)\n",
 			      dp_link_bw, dp_link_count);
-		return false;
 
-	case DP_LINK_BW_1_62:
-		*out = 3 * dp_link_count;
-		break;
-	case DP_LINK_BW_2_7:
-		*out = 5 * dp_link_count;
-		break;
-	case DP_LINK_BW_5_4:
-		*out = 10 * dp_link_count;
-		break;
-	case DP_LINK_BW_8_1:
-		*out = 15 * dp_link_count;
-		break;
-	}
-	return true;
+	return dp_link_bw * dp_link_count / 2;
 }
 
 /**
@@ -3032,9 +3014,9 @@ int drm_dp_mst_topology_mgr_set_mst(struct drm_dp_mst_topology_mgr *mgr, bool ms
 			goto out_unlock;
 		}
 
-		if (!drm_dp_get_vc_payload_bw(mgr->dpcd[1],
-					      mgr->dpcd[2] & DP_MAX_LANE_COUNT_MASK,
-					      &mgr->pbn_div)) {
+		mgr->pbn_div = drm_dp_get_vc_payload_bw(mgr->dpcd[1],
+							mgr->dpcd[2] & DP_MAX_LANE_COUNT_MASK);
+		if (mgr->pbn_div == 0) {
 			ret = -EINVAL;
 			goto out_unlock;
 		}
@@ -3860,13 +3842,6 @@ EXPORT_SYMBOL(drm_dp_check_act_status);
  */
 int drm_dp_calc_pbn_mode(int clock, int bpp)
 {
-	u64 kbps;
-	s64 peak_kbps;
-	u32 numerator;
-	u32 denominator;
-
-	kbps = clock * bpp;
-
 	/*
 	 * margin 5300ppm + 300ppm ~ 0.6% as per spec, factor is 1.006
 	 * The unit of 54/64Mbytes/sec is an arbitrary unit chosen based on
@@ -3877,14 +3852,8 @@ int drm_dp_calc_pbn_mode(int clock, int bpp)
 	 * peak_kbps *= (64/54)
 	 * peak_kbps *= 8    convert to bytes
 	 */
-
-	numerator = 64 * 1006;
-	denominator = 54 * 8 * 1000 * 1000;
-
-	kbps *= numerator;
-	peak_kbps = drm_fixp_from_fraction(kbps, denominator);
-
-	return drm_fixp2int_ceil(peak_kbps);
+	return DIV_ROUND_UP_ULL(mul_u32_u32(clock * bpp, 64 * 1006),
+				8 * 54 * 1000 * 1000);
 }
 EXPORT_SYMBOL(drm_dp_calc_pbn_mode);
 
