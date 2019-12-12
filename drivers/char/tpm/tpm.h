@@ -162,6 +162,7 @@ enum tpm_chip_flags {
 	TPM_CHIP_FLAG_VIRTUAL		= BIT(3),
 	TPM_CHIP_FLAG_HAVE_TIMEOUTS	= BIT(4),
 	TPM_CHIP_FLAG_ALWAYS_POWERED	= BIT(5),
+	TPM_CHIP_FLAG_FIRMWARE_POWER_MANAGED	= BIT(6),
 };
 
 #define to_tpm_chip(d) container_of(d, struct tpm_chip, dev)
@@ -186,19 +187,16 @@ struct	stclear_flags_t {
 	u8	bGlobalLock;
 } __packed;
 
-struct	tpm_version_t {
-	u8	Major;
-	u8	Minor;
-	u8	revMajor;
-	u8	revMinor;
+struct tpm1_version {
+	u8 major;
+	u8 minor;
+	u8 rev_major;
+	u8 rev_minor;
 } __packed;
 
-struct	tpm_version_1_2_t {
-	__be16	tag;
-	u8	Major;
-	u8	Minor;
-	u8	revMajor;
-	u8	revMinor;
+struct tpm1_version2 {
+	__be16 tag;
+	struct tpm1_version version;
 } __packed;
 
 struct	timeout_t {
@@ -243,8 +241,8 @@ typedef union {
 	struct	stclear_flags_t	stclear_flags;
 	__u8	owned;
 	__be32	num_pcrs;
-	struct	tpm_version_t	tpm_version;
-	struct	tpm_version_1_2_t tpm_version_1_2;
+	struct tpm1_version version1;
+	struct tpm1_version2 version2;
 	__be32	manufacturer_id;
 	struct timeout_t  timeout;
 	struct duration_t duration;
@@ -284,7 +282,6 @@ enum tpm_buf_flags {
 };
 
 struct tpm_buf {
-	struct page *data_page;
 	unsigned int flags;
 	u8 *data;
 };
@@ -300,20 +297,18 @@ static inline void tpm_buf_reset(struct tpm_buf *buf, u16 tag, u32 ordinal)
 
 static inline int tpm_buf_init(struct tpm_buf *buf, u16 tag, u32 ordinal)
 {
-	buf->data_page = alloc_page(GFP_HIGHUSER);
-	if (!buf->data_page)
+	buf->data = (u8 *)__get_free_page(GFP_KERNEL);
+	if (!buf->data)
 		return -ENOMEM;
 
 	buf->flags = 0;
-	buf->data = kmap(buf->data_page);
 	tpm_buf_reset(buf, tag, ordinal);
 	return 0;
 }
 
 static inline void tpm_buf_destroy(struct tpm_buf *buf)
 {
-	kunmap(buf->data_page);
-	__free_page(buf->data_page);
+	free_page(buf->data);
 }
 
 static inline u32 tpm_buf_length(struct tpm_buf *buf)
